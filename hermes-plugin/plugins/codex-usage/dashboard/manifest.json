@@ -1,0 +1,7 @@
+{
+  "name": "codex-usage",
+  "label": "Codex Usage",
+  "description": "Read-only Codex quota and per-model token telemetry for the Hermes desktop widget.",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}
