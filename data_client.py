@@ -24,6 +24,7 @@ class HermesUsageData:
         self.hermes_home = hermes_home
         self.db_path = hermes_home / "state.db"
         self.quota_worker = quota_worker
+        self.grok_quota_worker = quota_worker.with_name("grok_quota_worker.py")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -189,3 +190,27 @@ class HermesUsageData:
             return payload if isinstance(payload, dict) else {"available": False, "limits": []}
         except Exception:
             return {"available": False, "limits": [], "error": "Codex quota is temporarily unavailable."}
+
+    def fetch_grok_quota(self) -> dict[str, Any]:
+        python_exe = self.hermes_home / "hermes-agent" / "venv" / "Scripts" / "python.exe"
+        if not python_exe.exists() or not self.grok_quota_worker.exists():
+            return {"available": False, "error": "SuperGrok quota collector is unavailable."}
+        environment = os.environ.copy()
+        environment["HERMES_HOME"] = str(self.hermes_home)
+        try:
+            completed = subprocess.run(
+                [str(python_exe), str(self.grok_quota_worker)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=25,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=environment,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError("SuperGrok quota worker failed")
+            payload = json.loads(completed.stdout.strip().splitlines()[-1])
+            return payload if isinstance(payload, dict) else {"available": False}
+        except Exception:
+            return {"available": False, "error": "SuperGrok usage is temporarily unavailable."}

@@ -9,17 +9,20 @@ A lightweight Windows popup and system-tray monitor for real ChatGPT/Codex quota
 ## What it shows
 
 - Real Codex account quota windows and reset times
+- Real SuperGrok weekly usage, remaining percentage, and reset time through Hermes's authenticated xAI OAuth
 - Current Hermes session spend: processed, input, output, and API calls
 - Historical totals for the most-used models
-- A **weekly-only button** in the header that collapses the widget to just the Codex weekly bar and remaining percentage
+- A **weekly-only button** in the header that collapses the widget to the Codex and Grok weekly bars and remaining percentages
+- A **GROK** button that opens the authoritative SuperGrok Usage page in your default browser
 - System-tray controls for show/hide, refresh, weekly-only mode, always-on-top, startup, and quit
 
-The expanded view preserves the original `CODEX USAGE` card layout. The compact view is intentionally not a redesign—it is the same widget collapsed to the one number most useful to leave on screen.
+The expanded `API USAGE` view identifies Codex and Grok as the monitored services while preserving the original card layout. The compact view is intentionally not a redesign—it is the same widget collapsed to the one number most useful to leave on screen.
 
 ## Honest data semantics
 
 - **Provider quota** comes from the authenticated ChatGPT/Codex account-usage response.
 - **Session spend** and **model totals** come from Hermes's read-only local telemetry database.
+- **SuperGrok quota** comes from the same authenticated Grok billing RPC used by `Settings → Usage`, using Hermes's local xAI OAuth token in a short-lived helper. The token never enters the widget process or repository.
 - These values are not context-window occupancy and are never converted into a made-up “tokens remaining” number.
 - Credentials never enter the UI, logs, repository, or packaged frontend.
 

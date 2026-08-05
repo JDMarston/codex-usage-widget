@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 import winreg
 from pathlib import Path
 from typing import Any, Callable
@@ -24,7 +25,8 @@ APP_NAME = "Codex Usage Widget"
 APP_ID = "CodexUsageWidget"
 IPC_PORT = 47631
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-SIZES = {"full": (382, 640), "small": (330, 150)}
+SIZES = {"full": (382, 710), "small": (330, 205)}
+GROK_USAGE_URL = "https://grok.com/?_s=usage"
 
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
 APP_DATA = LOCAL_APP_DATA / APP_ID
@@ -95,6 +97,14 @@ def visible_limits(quota: dict[str, Any] | None, model: Any, maximum: int = 2) -
         if len(selected) >= maximum:
             break
     return selected
+
+
+def launch_grok_usage(opener: Callable[..., Any] | None = None) -> bool:
+    try:
+        return bool((opener or webbrowser.open)(GROK_USAGE_URL, new=2))
+    except Exception:
+        logging.exception("Could not open Grok usage")
+        return False
 
 
 def resource_path(name: str) -> Path:
@@ -261,7 +271,7 @@ class UsageWidget:
         self.visible = not start_hidden
         self.quitting = False
         self.drag_origin: tuple[int, int, int, int] | None = None
-        self.state: dict[str, Any] = {"quota": None, "session": None, "models": None}
+        self.state: dict[str, Any] = {"quota": None, "grok_quota": None, "session": None, "models": None}
         self.last_updated: float | None = None
         self.last_error: str | None = None
         self.tray: pystray.Icon | None = None
@@ -370,15 +380,32 @@ class UsageWidget:
         title_box = tk.Frame(header, bg=self.colors["window"])
         title_box.pack(side="left", fill="y")
         self._bind_drag(title_box)
-        title = self._label(title_box, "CODEX USAGE", font=_font(11, "bold"), anchor="w")
+        title = self._label(title_box, "API USAGE", font=_font(11, "bold"), anchor="w")
         title.pack(anchor="w")
         self._bind_drag(title)
 
         status_row = tk.Frame(title_box, bg=self.colors["window"])
         status_row.pack(anchor="w", pady=(4, 0))
         self._bind_drag(status_row)
+        monitored_models = tk.Frame(
+            status_row,
+            bg=self.colors["card"],
+            highlightbackground=self.colors["border"],
+            highlightthickness=1,
+        )
+        monitored_models.pack(side="left")
+        monitored_label = self._label(
+            monitored_models,
+            "CODEX · GROK",
+            bg=self.colors["card"],
+            fg=self.colors["muted"],
+            font=_font(7, "bold"),
+        )
+        monitored_label.pack(padx=5, pady=2)
+        self._bind_drag(monitored_models)
+        self._bind_drag(monitored_label)
         self.status_dot = tk.Canvas(status_row, width=8, height=8, bg=self.colors["window"], highlightthickness=0)
-        self.status_dot.pack(side="left", pady=(2, 0))
+        self.status_dot.pack(side="left", padx=(7, 0), pady=(2, 0))
         self.status_dot.create_oval(1, 1, 7, 7, fill=self.colors["orange"], outline="", tags="dot")
         self.status_var = tk.StringVar(value="Connecting to Hermes…")
         status_label = self._label(status_row, textvariable=self.status_var, fg=self.colors["muted"], font=_font(8))
@@ -417,6 +444,23 @@ class UsageWidget:
         )
         size_button.pack(side="right", anchor="n", padx=(0, 2))
 
+        if self.layout == "full":
+            grok_button = tk.Button(
+                header,
+                text="GROK",
+                command=self.open_grok_usage,
+                bg=self.colors["window"],
+                fg=self.colors["accent"],
+                activebackground=self.colors["card"],
+                activeforeground=self.colors["text"],
+                borderwidth=0,
+                highlightthickness=0,
+                font=_font(8, "bold"),
+                cursor="hand2",
+                width=5,
+            )
+            grok_button.pack(side="right", anchor="n", padx=(0, 3), pady=(3, 0))
+
         content = tk.Frame(outer, bg=self.colors["window"])
         content.pack(fill="both", expand=True, padx=15, pady=(0, 10 if self.layout == "full" else 8))
 
@@ -432,7 +476,7 @@ class UsageWidget:
             self._sync_status()
             return
 
-        self._section_title(content, "ChatGPT quota").pack(fill="x", pady=(0, 5))
+        self._section_title(content, "Account quota").pack(fill="x", pady=(0, 5))
         self.quota_container = tk.Frame(content, bg=self.colors["window"])
         self.quota_container.pack(fill="x")
         self._render_loading_quota()
@@ -493,7 +537,7 @@ class UsageWidget:
 
         footer = tk.Frame(outer, bg=self.colors["window"])
         footer.pack(fill="x", padx=15, pady=(0, 12))
-        self.footer_var = tk.StringVar(value="Quota from ChatGPT · tokens from Hermes")
+        self.footer_var = tk.StringVar(value="Quota from ChatGPT + Grok · tokens from Hermes")
         self._label(footer, textvariable=self.footer_var, fg=self.colors["faint"], font=_font(7), anchor="w").pack(side="left")
         tk.Button(
             footer,
@@ -588,18 +632,28 @@ class UsageWidget:
         session = self.state.get("session") or {}
         if self.layout == "small":
             account = next((item for item in quota.get("limits", []) if item.get("kind") == "account"), None)
+            grok_quota = self.state.get("grok_quota") or {}
+            grok_limit = grok_quota.get("limit") if grok_quota.get("available") else None
             if account:
                 self._quota_card(self.quota_container, account, small=True)
-            else:
-                self._label(self.quota_container, "Codex weekly quota unavailable", fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=8)
+            if isinstance(grok_limit, dict):
+                self._quota_card(self.quota_container, grok_limit, small=True)
+            if not account and not isinstance(grok_limit, dict):
+                self._label(self.quota_container, "Weekly quotas unavailable", fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=8)
             return
         limits = visible_limits(quota, session.get("model"), maximum=2)
-        if not limits:
-            message = str(quota.get("error") or "No quota window was returned.")
-            self._label(self.quota_container, message, fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=6)
-            return
         for limit in limits:
             self._quota_card(self.quota_container, limit, small=False)
+        grok_quota = self.state.get("grok_quota") or {}
+        grok_limit = grok_quota.get("limit") if grok_quota.get("available") else None
+        if isinstance(grok_limit, dict):
+            self._quota_card(self.quota_container, grok_limit, small=False)
+        elif limits:
+            message = str(grok_quota.get("error") or "SuperGrok weekly quota unavailable")
+            self._label(self.quota_container, message, fg=self.colors["faint"], font=_font(8), anchor="w").pack(fill="x", pady=(0, 5))
+        else:
+            message = str(quota.get("error") or grok_quota.get("error") or "No account quota was returned.")
+            self._label(self.quota_container, message, fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=6)
 
     def _render_session(self) -> None:
         if self.layout != "full":
@@ -661,6 +715,7 @@ class UsageWidget:
             pystray.MenuItem("Show / hide", command("toggle"), default=True),
             pystray.MenuItem("Refresh now", command("refresh")),
             pystray.MenuItem("Weekly only", command("size"), checked=lambda _item: self.layout == "small"),
+            pystray.MenuItem("Open Grok usage", command("grok")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Always on top", command("topmost"), checked=lambda _item: bool(self.settings["always_on_top"])),
             pystray.MenuItem("Start with Windows", command("startup"), checked=lambda _item: startup_enabled()),
@@ -671,7 +726,7 @@ class UsageWidget:
         self.tray.run_detached()
 
     def _poll_loop(self) -> None:
-        next_session = next_models = next_quota = 0.0
+        next_session = next_models = next_quota = next_grok_quota = 0.0
         while not self.stop_event.is_set():
             now = time.monotonic()
             forced = self.force_all
@@ -687,13 +742,16 @@ class UsageWidget:
                 if forced or now >= next_quota:
                     snapshot["quota"] = self.data.fetch_quota()
                     next_quota = now + (300.0 if self.visible else 900.0)
+                if forced or now >= next_grok_quota:
+                    snapshot["grok_quota"] = self.data.fetch_grok_quota()
+                    next_grok_quota = now + (300.0 if self.visible else 900.0)
                 if snapshot:
                     snapshot["collected_at"] = time.time()
                     self.events.put(("snapshot", snapshot))
             except Exception:
                 logging.exception("Usage polling failed")
                 self.events.put(("error", "Collector offline — retrying"))
-            wait_until = min(next_session, next_models, next_quota)
+            wait_until = min(next_session, next_models, next_quota, next_grok_quota)
             timeout = max(0.5, min(60.0, wait_until - time.monotonic()))
             self.refresh_event.wait(timeout)
             self.refresh_event.clear()
@@ -703,7 +761,7 @@ class UsageWidget:
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "snapshot":
-                    for key in ("quota", "session", "models"):
+                    for key in ("quota", "grok_quota", "session", "models"):
                         if key in payload:
                             self.state[key] = payload[key]
                     self.last_updated = float(payload.get("collected_at") or time.time())
@@ -711,7 +769,7 @@ class UsageWidget:
                     self._sync_status()
                     if self.layout == "full":
                         timestamp = time.strftime("%I:%M %p", time.localtime(self.last_updated)).lstrip("0")
-                        self.footer_var.set(f"Quota from ChatGPT · tokens from Hermes · {timestamp}")
+                        self.footer_var.set(f"Quota from ChatGPT + Grok · tokens from Hermes · {timestamp}")
                     self._render_all()
                     self._update_tray()
                 elif kind == "error":
@@ -740,6 +798,8 @@ class UsageWidget:
             self.refresh_now()
         elif command == "size":
             self.toggle_size()
+        elif command == "grok":
+            self.open_grok_usage()
         elif command == "topmost":
             self.settings["always_on_top"] = not bool(self.settings["always_on_top"])
             self.root.attributes("-topmost", bool(self.settings["always_on_top"]))
@@ -764,6 +824,11 @@ class UsageWidget:
         self._build_ui()
         if self.tray:
             self.tray.update_menu()
+
+    def open_grok_usage(self) -> None:
+        if not launch_grok_usage():
+            self.last_error = "Could not open Grok Usage"
+            self._sync_status()
 
     def refresh_now(self) -> None:
         self.status_dot.itemconfigure("dot", fill=self.colors["orange"])

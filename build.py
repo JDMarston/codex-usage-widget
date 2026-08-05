@@ -39,6 +39,8 @@ def main() -> int:
         "--add-data",
         f"{ROOT / 'quota_worker.py'};.",
         "--add-data",
+        f"{ROOT / 'grok_quota_worker.py'};.",
+        "--add-data",
         f"{ROOT / 'hermes-plugin'};hermes-plugin",
         "--hidden-import",
         "pystray._win32",

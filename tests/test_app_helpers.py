@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import choose_current_limit, compact_number, reset_text, visible_limits
+from app import GROK_USAGE_URL, choose_current_limit, compact_number, launch_grok_usage, reset_text, visible_limits
 
 
 class FormattingTests(unittest.TestCase):
@@ -29,6 +29,16 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(choose_current_limit(quota, "gpt-5.3-codex-spark")["id"], "spark")
         self.assertEqual(choose_current_limit(quota, "gpt-5.6-sol")["id"], "account")
         self.assertEqual([item["id"] for item in visible_limits(quota, "gpt-5.3-codex-spark")], ["spark", "account"])
+
+    def test_grok_usage_launcher_uses_official_usage_page(self) -> None:
+        calls: list[tuple[str, int]] = []
+
+        def opener(url: str, *, new: int) -> bool:
+            calls.append((url, new))
+            return True
+
+        self.assertTrue(launch_grok_usage(opener))
+        self.assertEqual(calls, [(GROK_USAGE_URL, 2)])
 
 
 if __name__ == "__main__":
