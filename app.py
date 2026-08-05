@@ -25,7 +25,7 @@ APP_NAME = "Codex Usage Widget"
 APP_ID = "CodexUsageWidget"
 IPC_PORT = 47631
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-SIZES = {"full": (382, 710), "small": (330, 205)}
+SIZES = {"full": (382, 710), "small": (330, 225)}
 GROK_USAGE_URL = "https://grok.com/?_s=usage"
 
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
@@ -97,6 +97,44 @@ def visible_limits(quota: dict[str, Any] | None, model: Any, maximum: int = 2) -
         if len(selected) >= maximum:
             break
     return selected
+
+
+def monitored_provider_labels(state: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+
+    def add(label: str) -> None:
+        normalized = label.strip().upper()
+        if normalized and normalized not in labels:
+            labels.append(normalized)
+
+    if state.get("quota") is not None:
+        add("Codex")
+    if state.get("grok_quota") is not None:
+        add("Grok")
+
+    snapshots = [state.get("session") or {}]
+    snapshots.extend((state.get("models") or {}).get("models") or [])
+    for item in snapshots:
+        kind = str(item.get("provider_kind") or "").lower()
+        if kind == "codex":
+            add("Codex")
+        elif kind == "grok":
+            add("Grok")
+        else:
+            for provider in item.get("providers") or []:
+                add(str(provider))
+    return labels
+
+
+def tray_usage_title(state: dict[str, Any]) -> str:
+    parts: list[str] = []
+    codex_limit = choose_current_limit(state.get("quota"), (state.get("session") or {}).get("model"))
+    if codex_limit and codex_limit.get("remaining_percent") is not None:
+        parts.append(f"Codex {percent(codex_limit['remaining_percent'])} left")
+    grok_limit = (state.get("grok_quota") or {}).get("limit")
+    if isinstance(grok_limit, dict) and grok_limit.get("remaining_percent") is not None:
+        parts.append(f"Grok {percent(grok_limit['remaining_percent'])} left")
+    return f"API Usage — {' · '.join(parts)}" if parts else "API Usage"
 
 
 def launch_grok_usage(opener: Callable[..., Any] | None = None) -> bool:
@@ -394,9 +432,10 @@ class UsageWidget:
             highlightthickness=1,
         )
         monitored_models.pack(side="left")
+        self.monitored_providers_var = tk.StringVar(value="DETECTING…")
         monitored_label = self._label(
             monitored_models,
-            "CODEX · GROK",
+            textvariable=self.monitored_providers_var,
             bg=self.colors["card"],
             fg=self.colors["muted"],
             font=_font(7, "bold"),
@@ -443,23 +482,6 @@ class UsageWidget:
             width=2,
         )
         size_button.pack(side="right", anchor="n", padx=(0, 2))
-
-        if self.layout == "full":
-            grok_button = tk.Button(
-                header,
-                text="GROK",
-                command=self.open_grok_usage,
-                bg=self.colors["window"],
-                fg=self.colors["accent"],
-                activebackground=self.colors["card"],
-                activeforeground=self.colors["text"],
-                borderwidth=0,
-                highlightthickness=0,
-                font=_font(8, "bold"),
-                cursor="hand2",
-                width=5,
-            )
-            grok_button.pack(side="right", anchor="n", padx=(0, 3), pady=(3, 0))
 
         content = tk.Frame(outer, bg=self.colors["window"])
         content.pack(fill="both", expand=True, padx=15, pady=(0, 10 if self.layout == "full" else 8))
@@ -591,8 +613,16 @@ class UsageWidget:
     def _draw_bar(self, canvas: tk.Canvas, used: float) -> None:
         canvas.delete("all")
         width = max(1, canvas.winfo_width())
-        canvas.create_rectangle(0, 0, width, 4, fill=self.colors["track"], outline="")
-        canvas.create_rectangle(0, 0, width * max(0.0, min(100.0, used)) / 100, 4, fill=self.colors["accent"], outline="")
+        height = max(1, int(canvas.cget("height")))
+        canvas.create_rectangle(0, 0, width, height, fill=self.colors["track"], outline="")
+        canvas.create_rectangle(
+            0,
+            0,
+            width * max(0.0, min(100.0, used)) / 100,
+            height,
+            fill=self.colors["accent"],
+            outline="",
+        )
 
     def _quota_card(self, parent: tk.Misc, limit: dict[str, Any], *, small: bool) -> None:
         card = tk.Frame(
@@ -616,9 +646,11 @@ class UsageWidget:
             fg=self._quota_color(remaining),
             font=_font(10, "bold"),
         ).pack(side="right")
-        bar = tk.Canvas(card, height=4, bg=self.colors["track"], highlightthickness=0)
+        bar = tk.Canvas(card, height=6, bg=self.colors["track"], highlightthickness=0)
         bar.pack(fill="x", padx=10, pady=(2, 8 if small else 3))
-        bar.bind("<Configure>", lambda _event, widget=bar, amount=used: self._draw_bar(widget, amount))
+        redraw = lambda _event=None, widget=bar, amount=used: self._draw_bar(widget, amount)
+        bar.bind("<Configure>", redraw)
+        self.root.after_idle(redraw)
         if not small:
             bottom = tk.Frame(card, bg=self.colors["card"])
             bottom.pack(fill="x", padx=10, pady=(0, 7))
@@ -701,6 +733,8 @@ class UsageWidget:
             self._label(row, compact_number(item.get("total_tokens")), bg=self.colors["card_alt"], font=_font(10, "bold")).pack(side="right", padx=9)
 
     def _render_all(self) -> None:
+        providers = monitored_provider_labels(self.state)
+        self.monitored_providers_var.set(" · ".join(providers) if providers else "DETECTING…")
         self._render_quota()
         self._render_session()
         self._render_models()
@@ -789,7 +823,7 @@ class UsageWidget:
         limit = choose_current_limit(self.state.get("quota"), (self.state.get("session") or {}).get("model"))
         remaining = float(limit.get("remaining_percent")) if limit and limit.get("remaining_percent") is not None else None
         self.tray.icon = _tray_image(remaining)
-        self.tray.title = f"Codex Usage — {percent(remaining)} left" if remaining is not None else APP_NAME
+        self.tray.title = tray_usage_title(self.state)
 
     def _handle_command(self, command: str) -> None:
         if command == "toggle":

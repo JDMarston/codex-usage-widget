@@ -6,7 +6,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import GROK_USAGE_URL, choose_current_limit, compact_number, launch_grok_usage, reset_text, visible_limits
+from app import (
+    GROK_USAGE_URL,
+    choose_current_limit,
+    compact_number,
+    launch_grok_usage,
+    monitored_provider_labels,
+    reset_text,
+    tray_usage_title,
+    visible_limits,
+)
 
 
 class FormattingTests(unittest.TestCase):
@@ -39,6 +48,30 @@ class FormattingTests(unittest.TestCase):
 
         self.assertTrue(launch_grok_usage(opener))
         self.assertEqual(calls, [(GROK_USAGE_URL, 2)])
+
+    def test_monitored_provider_labels_are_data_driven_and_extensible(self) -> None:
+        state = {
+            "quota": {"available": True},
+            "grok_quota": {"available": True},
+            "session": {"provider_kind": "grok", "providers": ["xai-oauth"]},
+            "models": {
+                "models": [
+                    {"provider_kind": "codex", "providers": ["openai-codex"]},
+                    {"provider_kind": "other", "providers": ["anthropic"]},
+                ]
+            },
+        }
+
+        self.assertEqual(monitored_provider_labels(state), ["CODEX", "GROK", "ANTHROPIC"])
+
+    def test_tray_title_includes_codex_and_grok_quota(self) -> None:
+        state = {
+            "quota": {"limits": [{"kind": "account", "remaining_percent": 74}]},
+            "grok_quota": {"limit": {"remaining_percent": 75}},
+            "session": {"model": "gpt-5.6-sol"},
+        }
+
+        self.assertEqual(tray_usage_title(state), "API Usage — Codex 74% left · Grok 75% left")
 
 
 if __name__ == "__main__":

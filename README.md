@@ -13,10 +13,10 @@ A lightweight Windows popup and system-tray monitor for real ChatGPT/Codex quota
 - Current Hermes session spend: processed, input, output, and API calls
 - Historical totals for the most-used models
 - A **weekly-only button** in the header that collapses the widget to the Codex and Grok weekly bars and remaining percentages
-- A **GROK** button that opens the authoritative SuperGrok Usage page in your default browser
+- A tray action that opens the authoritative SuperGrok Usage page in your default browser
 - System-tray controls for show/hide, refresh, weekly-only mode, always-on-top, startup, and quit
 
-The expanded `API USAGE` view identifies Codex and Grok as the monitored services while preserving the original card layout. The compact view is intentionally not a redesign—it is the same widget collapsed to the one number most useful to leave on screen.
+The expanded `API USAGE` view identifies the currently detected providers while preserving the original card layout. That provider badge is generated from live quota and model telemetry, so additional providers can appear without hardcoding a fixed Codex/Grok list. The compact view keeps matching weekly progress cards for every supported quota provider.
 
 ## Honest data semantics
 
