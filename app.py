@@ -54,6 +54,10 @@ def percent(value: Any) -> str:
         return "—"
 
 
+def used_percent_tooltip(value: Any) -> str:
+    return f"{percent(value)} used"
+
+
 def reset_text(epoch: Any, now: float | None = None) -> str:
     try:
         remaining = float(epoch) - (time.time() if now is None else now)
@@ -313,6 +317,7 @@ class UsageWidget:
         self.last_updated: float | None = None
         self.last_error: str | None = None
         self.tray: pystray.Icon | None = None
+        self.tooltip_window: tk.Toplevel | None = None
         self.data = HermesUsageData(HERMES_HOME, resource_path("quota_worker.py"))
 
         dark = _system_uses_dark_mode()
@@ -399,6 +404,7 @@ class UsageWidget:
         widget.bind("<ButtonRelease-1>", self._end_drag)
 
     def _build_ui(self) -> None:
+        self._hide_tooltip()
         for child in self.root.winfo_children():
             child.destroy()
 
@@ -624,6 +630,40 @@ class UsageWidget:
             outline="",
         )
 
+    def _show_tooltip(self, text: str) -> None:
+        self._hide_tooltip()
+        window = tk.Toplevel(self.root)
+        self.tooltip_window = window
+        window.withdraw()
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        label = tk.Label(
+            window,
+            text=text,
+            bg="#252a38",
+            fg="#f1f3f8",
+            font=_font(8, "bold"),
+            padx=7,
+            pady=4,
+            borderwidth=1,
+            relief="solid",
+        )
+        label.pack()
+        window.update_idletasks()
+        x = min(self.root.winfo_pointerx() + 12, self.root.winfo_screenwidth() - window.winfo_reqwidth() - 4)
+        y = min(self.root.winfo_pointery() + 14, self.root.winfo_screenheight() - window.winfo_reqheight() - 4)
+        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+        window.deiconify()
+
+    def _hide_tooltip(self) -> None:
+        if self.tooltip_window is None:
+            return
+        try:
+            self.tooltip_window.destroy()
+        except tk.TclError:
+            pass
+        self.tooltip_window = None
+
     def _quota_card(self, parent: tk.Misc, limit: dict[str, Any], *, small: bool) -> None:
         card = tk.Frame(
             parent,
@@ -650,6 +690,10 @@ class UsageWidget:
         bar.pack(fill="x", padx=10, pady=(2, 8 if small else 3))
         redraw = lambda _event=None, widget=bar, amount=used: self._draw_bar(widget, amount)
         bar.bind("<Configure>", redraw)
+        if small:
+            tooltip_text = used_percent_tooltip(used)
+            bar.bind("<Enter>", lambda _event, text=tooltip_text: self._show_tooltip(text))
+            bar.bind("<Leave>", lambda _event: self._hide_tooltip())
         self.root.after_idle(redraw)
         if not small:
             bottom = tk.Frame(card, bg=self.colors["card"])
@@ -880,6 +924,7 @@ class UsageWidget:
 
     def hide(self) -> None:
         self.visible = False
+        self._hide_tooltip()
         self.root.withdraw()
 
     def request_ipc(self, command: str) -> None:
@@ -906,6 +951,7 @@ class UsageWidget:
         if self.quitting:
             return
         self.quitting = True
+        self._hide_tooltip()
         self.stop_event.set()
         self.refresh_event.set()
         self.settings.update({"window_x": self.root.winfo_x(), "window_y": self.root.winfo_y()})

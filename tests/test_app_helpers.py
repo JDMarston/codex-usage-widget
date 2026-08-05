@@ -14,6 +14,7 @@ from app import (
     monitored_provider_labels,
     reset_text,
     tray_usage_title,
+    used_percent_tooltip,
     visible_limits,
 )
 
@@ -27,6 +28,9 @@ class FormattingTests(unittest.TestCase):
     def test_reset_text(self) -> None:
         self.assertEqual(reset_text(1_000 + 61, now=1_000), "resets in 2m")
         self.assertEqual(reset_text(1_000 + 7_200, now=1_000), "resets in 2h 0m")
+
+    def test_used_percent_tooltip(self) -> None:
+        self.assertEqual(used_percent_tooltip(24.6), "25% used")
 
     def test_model_specific_limit_wins(self) -> None:
         quota = {
