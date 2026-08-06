@@ -13,6 +13,7 @@ import time
 import tkinter as tk
 import webbrowser
 import winreg
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,8 +55,38 @@ def percent(value: Any) -> str:
         return "—"
 
 
-def used_percent_tooltip(value: Any) -> str:
-    return f"{percent(value)} used"
+def local_datetime_text(epoch: Any) -> str | None:
+    try:
+        moment = datetime.fromtimestamp(float(epoch)).astimezone()
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    clock = moment.strftime("%I:%M %p").lstrip("0")
+    zone = moment.tzname() or "local time"
+    return f"{moment.strftime('%b')} {moment.day}, {moment.year} at {clock} {zone}"
+
+
+def quota_tooltip_text(
+    limit: dict[str, Any],
+    *,
+    formatter: Callable[[Any], str | None] = local_datetime_text,
+) -> str:
+    lines = [f"{percent(limit.get('used_percent'))} used"]
+    reset_at = limit.get("reset_at")
+    period_start = limit.get("period_start_at")
+    if period_start is None and reset_at is not None:
+        try:
+            window_seconds = float(limit.get("window_seconds"))
+            if window_seconds > 0:
+                period_start = float(reset_at) - window_seconds
+        except (TypeError, ValueError):
+            pass
+    last_reset = formatter(period_start) if period_start is not None else None
+    next_reset = formatter(reset_at) if reset_at is not None else None
+    if last_reset:
+        lines.append(f"Last reset: {last_reset}")
+    if next_reset:
+        lines.append(f"Next reset: {next_reset}")
+    return "\n".join(lines)
 
 
 def reset_text(epoch: Any, now: float | None = None) -> str:
@@ -691,7 +722,7 @@ class UsageWidget:
         redraw = lambda _event=None, widget=bar, amount=used: self._draw_bar(widget, amount)
         bar.bind("<Configure>", redraw)
         if small:
-            tooltip_text = used_percent_tooltip(used)
+            tooltip_text = quota_tooltip_text(limit)
             bar.bind("<Enter>", lambda _event, text=tooltip_text: self._show_tooltip(text))
             bar.bind("<Leave>", lambda _event: self._hide_tooltip())
         self.root.after_idle(redraw)

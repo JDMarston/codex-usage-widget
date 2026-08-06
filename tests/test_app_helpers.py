@@ -11,10 +11,10 @@ from app import (
     choose_current_limit,
     compact_number,
     launch_grok_usage,
+    quota_tooltip_text,
     monitored_provider_labels,
     reset_text,
     tray_usage_title,
-    used_percent_tooltip,
     visible_limits,
 )
 
@@ -29,8 +29,18 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(reset_text(1_000 + 61, now=1_000), "resets in 2m")
         self.assertEqual(reset_text(1_000 + 7_200, now=1_000), "resets in 2h 0m")
 
-    def test_used_percent_tooltip(self) -> None:
-        self.assertEqual(used_percent_tooltip(24.6), "25% used")
+    def test_quota_tooltip_uses_reported_period_start_and_next_reset(self) -> None:
+        limit = {"used_percent": 24.6, "period_start_at": 1_000, "reset_at": 2_000}
+        text = quota_tooltip_text(limit, formatter=lambda value: f"time-{value}")
+        self.assertEqual(text, "25% used\nLast reset: time-1000\nNext reset: time-2000")
+
+    def test_quota_tooltip_derives_last_reset_from_window_length(self) -> None:
+        limit = {"used_percent": 40, "reset_at": 700_000, "window_seconds": 604_800}
+        text = quota_tooltip_text(limit, formatter=lambda value: f"time-{int(value)}")
+        self.assertEqual(text, "40% used\nLast reset: time-95200\nNext reset: time-700000")
+
+    def test_quota_tooltip_omits_unavailable_reset_times(self) -> None:
+        self.assertEqual(quota_tooltip_text({"used_percent": 9}), "9% used")
 
     def test_model_specific_limit_wins(self) -> None:
         quota = {
