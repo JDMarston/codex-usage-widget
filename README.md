@@ -10,19 +10,21 @@ A lightweight Windows popup and system-tray monitor for real ChatGPT/Codex quota
 
 - Real Codex account quota windows and reset times
 - Real SuperGrok weekly usage, remaining percentage, and reset time through Hermes's authenticated xAI OAuth
+- Real Gemini model rate-limit headroom from Google AI Studio (RPM, TPM, and RPD), with the most constrained meter shown as the actionable bar
 - Current Hermes session spend: processed, input, output, and API calls
-- Historical totals for the most-used models
-- A **weekly-only button** in the header that collapses the widget to the Codex and Grok weekly bars and remaining percentages
+- Historical totals for **every** Hermes model, with the active model promoted to the top as soon as it is selected
+- A **compact-view button** in the header that collapses the widget to one actionable bar per detected quota provider
 - A tray action that opens the authoritative SuperGrok Usage page in your default browser
-- System-tray controls for show/hide, refresh, weekly-only mode, always-on-top, startup, and quit
+- System-tray controls for show/hide, refresh, compact view, always-on-top, startup, and quit
 
-The expanded `API USAGE` view identifies the currently detected providers while preserving the original card layout. That provider badge is generated from live quota and model telemetry, so additional providers can appear without hardcoding a fixed Codex/Grok list. The compact view keeps matching weekly progress cards for every supported quota provider.
+The expanded `API USAGE` view identifies the currently connected providers while preserving the original card layout. Quota collectors are gated by Hermes's active credentials, so removing a provider disables its collector even though its old token history remains available below. The provider badge and scrollable model list remain data-driven, and a newly selected Hermes model appears automatically even before it has a historical usage row.
 
 ## Honest data semantics
 
 - **Provider quota** comes from the authenticated ChatGPT/Codex account-usage response.
 - **Session spend** and **model totals** come from Hermes's read-only local telemetry database.
 - **SuperGrok quota** comes from the same authenticated Grok billing RPC used by `Settings → Usage`, using Hermes's local xAI OAuth token in a short-lived helper. The token never enters the widget process or repository.
+- **Gemini quota** comes from the authenticated Google AI Studio Rate Limit page through the dedicated local Bob Browser CDP session. A short-lived helper reads only sanitized model/RPM/TPM/RPD table cells; Google browser authorization and cookies never enter the widget process, output, logs, or repository.
 - These values are not context-window occupancy and are never converted into a made-up “tokens remaining” number.
 - Credentials never enter the UI, logs, repository, or packaged frontend.
 
@@ -33,7 +35,7 @@ The persistent widget is one process. It reads Hermes's SQLite telemetry directl
 | Data | Visible | Hidden in tray |
 |---|---:|---:|
 | Current session | 10 seconds | 60 seconds |
-| Model aggregates | 2 minutes | 10 minutes |
+| Model aggregates | 15 seconds | 2 minutes |
 | Provider quota | 5 minutes | 15 minutes |
 
 The quota helper runs only during a provider refresh and exits immediately. The local build uses PyInstaller one-directory mode to avoid an extra one-file bootstrap process.

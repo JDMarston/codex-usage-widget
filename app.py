@@ -28,6 +28,18 @@ IPC_PORT = 47631
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SIZES = {"full": (382, 710), "small": (330, 225)}
 GROK_USAGE_URL = "https://grok.com/?_s=usage"
+RESIZE_BORDER = 6
+MIN_SIZES = {"full": (320, 480), "small": (280, 180)}
+RESIZE_CURSORS = {
+    "n": "size_ns",
+    "s": "size_ns",
+    "e": "size_we",
+    "w": "size_we",
+    "ne": "size_ne_sw",
+    "nw": "size_nw_se",
+    "se": "size_nw_se",
+    "sw": "size_ne_sw",
+}
 
 LOCAL_APP_DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
 APP_DATA = LOCAL_APP_DATA / APP_ID
@@ -71,6 +83,9 @@ def quota_tooltip_text(
     formatter: Callable[[Any], str | None] = local_datetime_text,
 ) -> str:
     lines = [f"{percent(limit.get('used_percent'))} used"]
+    details = str(limit.get("details") or "").strip()
+    if details:
+        lines.extend(line for line in details.splitlines() if line.strip())
     reset_at = limit.get("reset_at")
     period_start = limit.get("period_start_at")
     if period_start is None and reset_at is not None:
@@ -142,34 +157,163 @@ def monitored_provider_labels(state: dict[str, Any]) -> list[str]:
         if normalized and normalized not in labels:
             labels.append(normalized)
 
-    if state.get("quota") is not None:
-        add("Codex")
-    if state.get("grok_quota") is not None:
-        add("Grok")
+    quota_snapshot = state.get("provider_quotas")
+    if isinstance(quota_snapshot, dict):
+        for provider in quota_snapshot.get("providers") or []:
+            if isinstance(provider, dict):
+                add(str(provider.get("label") or provider.get("id") or ""))
+        return labels
 
-    snapshots = [state.get("session") or {}]
-    snapshots.extend((state.get("models") or {}).get("models") or [])
-    for item in snapshots:
-        kind = str(item.get("provider_kind") or "").lower()
-        if kind == "codex":
-            add("Codex")
-        elif kind == "grok":
-            add("Grok")
-        else:
-            for provider in item.get("providers") or []:
-                add(str(provider))
+    # Before the first credential-backed quota snapshot arrives, show only
+    # the current session provider. Historical model rows are deliberately
+    # excluded so a removed provider cannot remain in the header forever.
+    item = state.get("session") or {}
+    kind = str(item.get("provider_kind") or "").lower()
+    if kind == "codex":
+        add("Codex")
+    elif kind == "grok":
+        add("Grok")
+    elif kind == "gemini":
+        add("Gemini")
+    else:
+        for provider in item.get("providers") or []:
+            add(str(provider))
     return labels
+
+
+def monitored_provider_text(state: dict[str, Any]) -> str:
+    labels = monitored_provider_labels(state)
+    if labels:
+        return " · ".join(labels)
+    return "DETECTING…" if state.get("provider_quotas") is None else "NONE CONNECTED"
 
 
 def tray_usage_title(state: dict[str, Any]) -> str:
     parts: list[str] = []
-    codex_limit = choose_current_limit(state.get("quota"), (state.get("session") or {}).get("model"))
-    if codex_limit and codex_limit.get("remaining_percent") is not None:
-        parts.append(f"Codex {percent(codex_limit['remaining_percent'])} left")
-    grok_limit = (state.get("grok_quota") or {}).get("limit")
-    if isinstance(grok_limit, dict) and grok_limit.get("remaining_percent") is not None:
-        parts.append(f"Grok {percent(grok_limit['remaining_percent'])} left")
+    model = (state.get("session") or {}).get("model")
+    for provider in (state.get("provider_quotas") or {}).get("providers") or []:
+        if not isinstance(provider, dict):
+            continue
+        limit = choose_current_limit(provider, model)
+        if limit and limit.get("remaining_percent") is not None:
+            label = str(provider.get("label") or provider.get("id") or "Provider")
+            parts.append(f"{label} {percent(limit['remaining_percent'])} left")
     return f"API Usage — {' · '.join(parts)}" if parts else "API Usage"
+
+
+def normalize_window_sizes(raw: Any) -> dict[str, list[int]]:
+    sizes = {name: [width, height] for name, (width, height) in SIZES.items()}
+    if not isinstance(raw, dict):
+        return sizes
+    for name, default in SIZES.items():
+        value = raw.get(name)
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            continue
+        try:
+            width = int(value[0])
+            height = int(value[1])
+        except (TypeError, ValueError):
+            continue
+        min_width, min_height = MIN_SIZES[name]
+        sizes[name] = [max(min_width, width), max(min_height, height)]
+    return sizes
+
+
+def layout_dimensions(layout: str, sizes: Any | None = None) -> tuple[int, int]:
+    normalized = normalize_window_sizes(sizes)
+    name = layout if layout in SIZES else "full"
+    width, height = normalized[name]
+    return int(width), int(height)
+
+
+def compute_resized_geometry(
+    edge: str,
+    *,
+    start_x: int,
+    start_y: int,
+    start_w: int,
+    start_h: int,
+    pointer_dx: int,
+    pointer_dy: int,
+    min_w: int,
+    min_h: int,
+    work_area: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    left, top, right, bottom = work_area
+    x, y, width, height = int(start_x), int(start_y), int(start_w), int(start_h)
+    edge = edge.lower()
+
+    if "e" in edge:
+        width = start_w + pointer_dx
+    if "s" in edge:
+        height = start_h + pointer_dy
+    if "w" in edge:
+        width = start_w - pointer_dx
+        x = start_x + pointer_dx
+    if "n" in edge:
+        height = start_h - pointer_dy
+        y = start_y + pointer_dy
+
+    if width < min_w:
+        if "w" in edge:
+            x -= min_w - width
+        width = min_w
+    if height < min_h:
+        if "n" in edge:
+            y -= min_h - height
+        height = min_h
+
+    max_width = max(min_w, right - left)
+    max_height = max(min_h, bottom - top)
+    width = min(width, max_width)
+    height = min(height, max_height)
+    x = min(max(left, x), max(left, right - width))
+    y = min(max(top, y), max(top, bottom - height))
+    return x, y, width, height
+
+
+def snapshot_render_targets(state: dict[str, Any], snapshot: dict[str, Any]) -> set[str]:
+    changed = {
+        key
+        for key in ("provider_quotas", "session", "models")
+        if key in snapshot and state.get(key) != snapshot[key]
+    }
+    if not changed:
+        return set()
+
+    targets = {"providers"}
+    if "session" in changed:
+        targets.add("session")
+    if "models" in changed:
+        targets.add("models")
+    if "provider_quotas" in changed:
+        targets.update({"quota", "tray"})
+
+    if "session" in changed:
+        old_model = _model_key((state.get("session") or {}).get("model"))
+        new_model = _model_key((snapshot.get("session") or {}).get("model"))
+        if old_model != new_model:
+            targets.update({"quota", "models", "tray"})
+    return targets
+
+
+def ordered_model_rows(models_snapshot: dict[str, Any] | None, active_model: Any) -> list[dict[str, Any]]:
+    """Keep every tracked model while placing the current one first.
+
+    ``fetch_models`` already returns every model Hermes has recorded.  The UI
+    must not truncate that source just because a newly selected model has less
+    historical usage than older entries.
+    """
+    models = [item for item in ((models_snapshot or {}).get("models") or []) if isinstance(item, dict)]
+    active_key = _model_key(active_model)
+    indexed = list(enumerate(models))
+    indexed.sort(
+        key=lambda pair: (
+            0 if active_key and _model_key(pair[1].get("model")) == active_key else 1,
+            pair[0],
+        )
+    )
+    return [item for _, item in indexed]
 
 
 def launch_grok_usage(opener: Callable[..., Any] | None = None) -> bool:
@@ -206,6 +350,7 @@ def _load_settings() -> dict[str, Any]:
         "layout": "full",
         "window_x": None,
         "window_y": None,
+        "sizes": {name: [width, height] for name, (width, height) in SIZES.items()},
     }
     try:
         stored = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -215,6 +360,7 @@ def _load_settings() -> dict[str, Any]:
         pass
     if settings.get("layout") not in SIZES:
         settings["layout"] = "full"
+    settings["sizes"] = normalize_window_sizes(settings.get("sizes"))
     return settings
 
 
@@ -281,6 +427,13 @@ def _tray_image(remaining: float | None) -> Image.Image:
     return image
 
 
+class _DaemonTrayIcon(pystray.Icon):
+    """Keep the Win32 tray loop from holding the process after Tk exits."""
+
+    def _run_detached(self) -> None:
+        threading.Thread(target=self._run, daemon=True, name="codex-usage-tray").start()
+
+
 class IpcServer:
     def __init__(self, callback: Callable[[str], None]) -> None:
         self.callback = callback
@@ -310,7 +463,8 @@ class IpcServer:
                     if command in {"SHOW", "QUIT"}:
                         self.callback(command.lower())
         except OSError:
-            logging.exception("IPC server stopped")
+            if not self.stop_event.is_set():
+                logging.exception("IPC server stopped unexpectedly")
         finally:
             server.close()
 
@@ -321,6 +475,8 @@ class IpcServer:
                 self.socket.close()
             except OSError:
                 pass
+        if self.thread.ident != threading.current_thread().ident:
+            self.thread.join(timeout=1.5)
 
 
 def signal_existing_instance(command: str = "SHOW") -> bool:
@@ -344,7 +500,8 @@ class UsageWidget:
         self.visible = not start_hidden
         self.quitting = False
         self.drag_origin: tuple[int, int, int, int] | None = None
-        self.state: dict[str, Any] = {"quota": None, "grok_quota": None, "session": None, "models": None}
+        self.resize_origin: tuple[str, int, int, int, int, int, int] | None = None
+        self.state: dict[str, Any] = {"provider_quotas": None, "session": None, "models": None}
         self.last_updated: float | None = None
         self.last_error: str | None = None
         self.tray: pystray.Icon | None = None
@@ -389,7 +546,7 @@ class UsageWidget:
         old_height = self.root.winfo_height() if not initial else 0
         old_x = self.root.winfo_x() if not initial else None
         old_y = self.root.winfo_y() if not initial else None
-        width, height = SIZES[self.layout]
+        width, height = layout_dimensions(self.layout, self.settings.get("sizes"))
         left, top, right, bottom = _work_area()
         saved_x = self.settings.get("window_x")
         saved_y = self.settings.get("window_y")
@@ -403,7 +560,9 @@ class UsageWidget:
         x = min(max(left, int(x)), max(left, right - width))
         y = min(max(top, int(y)), max(top, bottom - height))
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.settings.update({"layout": self.layout, "window_x": x, "window_y": y})
+        sizes = normalize_window_sizes(self.settings.get("sizes"))
+        sizes[self.layout] = [width, height]
+        self.settings.update({"layout": self.layout, "window_x": x, "window_y": y, "sizes": sizes})
         _save_settings(self.settings)
         self.root.update_idletasks()
         try:
@@ -434,6 +593,67 @@ class UsageWidget:
         widget.bind("<B1-Motion>", self._drag)
         widget.bind("<ButtonRelease-1>", self._end_drag)
 
+    def _install_resize_handles(self, parent: tk.Misc) -> None:
+        specs: list[tuple[str, dict[str, Any]]] = [
+            ("n", {"relx": 0, "rely": 0, "relwidth": 1, "height": RESIZE_BORDER}),
+            ("s", {"relx": 0, "rely": 1, "relwidth": 1, "height": RESIZE_BORDER, "anchor": "sw"}),
+            ("e", {"relx": 1, "rely": 0, "relheight": 1, "width": RESIZE_BORDER, "anchor": "ne"}),
+            ("w", {"relx": 0, "rely": 0, "relheight": 1, "width": RESIZE_BORDER}),
+            ("nw", {"relx": 0, "rely": 0, "width": RESIZE_BORDER + 4, "height": RESIZE_BORDER + 4}),
+            ("ne", {"relx": 1, "rely": 0, "width": RESIZE_BORDER + 4, "height": RESIZE_BORDER + 4, "anchor": "ne"}),
+            ("sw", {"relx": 0, "rely": 1, "width": RESIZE_BORDER + 4, "height": RESIZE_BORDER + 4, "anchor": "sw"}),
+            ("se", {"relx": 1, "rely": 1, "width": RESIZE_BORDER + 8, "height": RESIZE_BORDER + 8, "anchor": "se"}),
+        ]
+        for edge, placement in specs:
+            handle = tk.Frame(
+                parent,
+                bg=self.colors["window"],
+                cursor=RESIZE_CURSORS[edge],
+                borderwidth=0,
+                highlightthickness=0,
+            )
+            handle.place(**placement)
+            handle.bind("<ButtonPress-1>", lambda event, name=edge: self._begin_resize(event, name))
+            handle.bind("<B1-Motion>", self._resize)
+            handle.bind("<ButtonRelease-1>", self._end_resize)
+            handle.lift()
+
+    def _sync_models_scrollregion(self) -> None:
+        canvas = getattr(self, "models_canvas", None)
+        if canvas is None:
+            return
+        canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
+
+    def _restore_models_scroll(self, fraction: float) -> None:
+        self._sync_models_scrollregion()
+        canvas = getattr(self, "models_canvas", None)
+        if canvas is not None:
+            canvas.yview_moveto(max(0.0, min(1.0, fraction)))
+
+    def _schedule_models_scroll_restore(self, fraction: float) -> None:
+        # Packing fresh rows briefly shrinks the canvas window to zero height.
+        # Restore only after Tk has completed that geometry pass so a polling
+        # refresh does not snap a user who is browsing older models to the top.
+        self.root.after(75, lambda: self._restore_models_scroll(fraction))
+
+    def _on_models_canvas_configure(self, event: tk.Event[Any]) -> None:
+        canvas = getattr(self, "models_canvas", None)
+        window = getattr(self, "models_window", None)
+        if canvas is None or window is None:
+            return
+        canvas.itemconfigure(window, width=event.width)
+        self._sync_models_scrollregion()
+
+    def _on_models_mousewheel(self, event: tk.Event[Any]) -> str | None:
+        canvas = getattr(self, "models_canvas", None)
+        if canvas is None:
+            return None
+        delta = int(getattr(event, "delta", 0) or 0)
+        if not delta:
+            return None
+        canvas.yview_scroll(-int(delta / 120), "units")
+        return "break"
+
     def _build_ui(self) -> None:
         self._hide_tooltip()
         for child in self.root.winfo_children():
@@ -447,7 +667,10 @@ class UsageWidget:
         )
         outer.pack(fill="both", expand=True)
 
-        header = tk.Frame(outer, bg=self.colors["window"], height=58, cursor="fleur")
+        body = tk.Frame(outer, bg=self.colors["window"])
+        body.pack(fill="both", expand=True)
+
+        header = tk.Frame(body, bg=self.colors["window"], height=58, cursor="fleur")
         header.pack(fill="x", padx=15, pady=(12, 5))
         header.pack_propagate(False)
         self._bind_drag(header)
@@ -520,7 +743,7 @@ class UsageWidget:
         )
         size_button.pack(side="right", anchor="n", padx=(0, 2))
 
-        content = tk.Frame(outer, bg=self.colors["window"])
+        content = tk.Frame(body, bg=self.colors["window"])
         content.pack(fill="both", expand=True, padx=15, pady=(0, 10 if self.layout == "full" else 8))
 
         if self.layout == "small":
@@ -530,9 +753,13 @@ class UsageWidget:
             self.metric_vars = {}
             self.models_total_var = tk.StringVar(value="")
             self.models_container = None
+            self.models_canvas = None
+            self.models_window = None
+            self.models_scrollbar = None
             self.footer_var = tk.StringVar(value="")
             self._render_quota()
             self._sync_status()
+            self._install_resize_handles(outer)
             return
 
         self._section_title(content, "Account quota").pack(fill="x", pady=(0, 5))
@@ -584,8 +811,32 @@ class UsageWidget:
         self._section_title(models_header, "Models · all tracked").pack(side="left")
         self.models_total_var = tk.StringVar(value="")
         self._label(models_header, textvariable=self.models_total_var, fg=self.colors["faint"], font=_font(8)).pack(side="right")
-        self.models_container = tk.Frame(content, bg=self.colors["window"])
-        self.models_container.pack(fill="x")
+        models_shell = tk.Frame(content, bg=self.colors["window"])
+        models_shell.pack(fill="both", expand=True)
+        self.models_scrollbar = tk.Scrollbar(
+            models_shell,
+            orient="vertical",
+            command=lambda *args: self.models_canvas.yview(*args),
+            bg=self.colors["card"],
+            activebackground=self.colors["border"],
+            troughcolor=self.colors["window"],
+            width=9,
+            highlightthickness=0,
+        )
+        self.models_scrollbar.pack(side="right", fill="y")
+        self.models_canvas = tk.Canvas(
+            models_shell,
+            bg=self.colors["window"],
+            borderwidth=0,
+            highlightthickness=0,
+            yscrollcommand=self.models_scrollbar.set,
+        )
+        self.models_canvas.pack(side="left", fill="both", expand=True)
+        self.models_container = tk.Frame(self.models_canvas, bg=self.colors["window"])
+        self.models_window = self.models_canvas.create_window((0, 0), window=self.models_container, anchor="nw")
+        self.models_container.bind("<Configure>", lambda _event: self._sync_models_scrollregion())
+        self.models_canvas.bind("<Configure>", self._on_models_canvas_configure)
+        self.models_canvas.bind("<MouseWheel>", self._on_models_mousewheel)
         self._label(
             self.models_container,
             "Loading model telemetry…",
@@ -594,9 +845,9 @@ class UsageWidget:
             anchor="w",
         ).pack(fill="x", pady=8)
 
-        footer = tk.Frame(outer, bg=self.colors["window"])
+        footer = tk.Frame(body, bg=self.colors["window"])
         footer.pack(fill="x", padx=15, pady=(0, 12))
-        self.footer_var = tk.StringVar(value="Quota from ChatGPT + Grok · tokens from Hermes")
+        self.footer_var = tk.StringVar(value="Quota from providers · tokens from Hermes")
         self._label(footer, textvariable=self.footer_var, fg=self.colors["faint"], font=_font(7), anchor="w").pack(side="left")
         tk.Button(
             footer,
@@ -615,15 +866,23 @@ class UsageWidget:
 
         self._render_all()
         self._sync_status()
+        self._install_resize_handles(outer)
 
     def _sync_status(self) -> None:
         if self.last_error:
             self.status_dot.itemconfigure("dot", fill=self.colors["red"])
             self.status_var.set(self.last_error)
             return
-        if self.state.get("quota") or self.state.get("session"):
+        if self.state.get("provider_quotas") or self.state.get("session"):
             self.status_dot.itemconfigure("dot", fill=self.colors["green"])
-            plan = (self.state.get("quota") or {}).get("plan")
+            plan = next(
+                (
+                    provider.get("plan")
+                    for provider in (self.state.get("provider_quotas") or {}).get("providers") or []
+                    if isinstance(provider, dict) and provider.get("plan")
+                ),
+                None,
+            )
             self.status_var.set(f"Live · {plan}" if plan else "Live")
             return
         self.status_dot.itemconfigure("dot", fill=self.colors["orange"])
@@ -730,36 +989,34 @@ class UsageWidget:
             bottom = tk.Frame(card, bg=self.colors["card"])
             bottom.pack(fill="x", padx=10, pady=(0, 7))
             self._label(bottom, f"{percent(used)} used", bg=self.colors["card"], fg=self.colors["faint"], font=_font(7)).pack(side="left")
-            self._label(bottom, reset_text(limit.get("reset_at")), bg=self.colors["card"], fg=self.colors["faint"], font=_font(7)).pack(side="right")
+            right_text = str(limit.get("usage_text") or limit.get("period_label") or "").strip()
+            if not right_text and limit.get("reset_at") is not None:
+                right_text = reset_text(limit.get("reset_at"))
+            if right_text:
+                self._label(bottom, right_text, bg=self.colors["card"], fg=self.colors["faint"], font=_font(7)).pack(side="right")
 
     def _render_quota(self) -> None:
         for child in self.quota_container.winfo_children():
             child.destroy()
-        quota = self.state.get("quota") or {}
+        provider_snapshot = self.state.get("provider_quotas") or {}
+        providers = [item for item in provider_snapshot.get("providers") or [] if isinstance(item, dict)]
         session = self.state.get("session") or {}
-        if self.layout == "small":
-            account = next((item for item in quota.get("limits", []) if item.get("kind") == "account"), None)
-            grok_quota = self.state.get("grok_quota") or {}
-            grok_limit = grok_quota.get("limit") if grok_quota.get("available") else None
-            if account:
-                self._quota_card(self.quota_container, account, small=True)
-            if isinstance(grok_limit, dict):
-                self._quota_card(self.quota_container, grok_limit, small=True)
-            if not account and not isinstance(grok_limit, dict):
-                self._label(self.quota_container, "Weekly quotas unavailable", fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=8)
-            return
-        limits = visible_limits(quota, session.get("model"), maximum=2)
-        for limit in limits:
-            self._quota_card(self.quota_container, limit, small=False)
-        grok_quota = self.state.get("grok_quota") or {}
-        grok_limit = grok_quota.get("limit") if grok_quota.get("available") else None
-        if isinstance(grok_limit, dict):
-            self._quota_card(self.quota_container, grok_limit, small=False)
-        elif limits:
-            message = str(grok_quota.get("error") or "SuperGrok weekly quota unavailable")
-            self._label(self.quota_container, message, fg=self.colors["faint"], font=_font(8), anchor="w").pack(fill="x", pady=(0, 5))
-        else:
-            message = str(quota.get("error") or grok_quota.get("error") or "No account quota was returned.")
+        rendered = 0
+        errors: list[str] = []
+        for provider in providers:
+            maximum = 1 if self.layout == "small" or provider.get("id") != "codex" else 2
+            limits = visible_limits(provider, session.get("model"), maximum=maximum)
+            for limit in limits:
+                self._quota_card(self.quota_container, limit, small=self.layout == "small")
+                rendered += 1
+            if not limits and provider.get("error"):
+                label = str(provider.get("label") or provider.get("id") or "Provider")
+                errors.append(f"{label}: {provider['error']}")
+        if self.layout != "small":
+            for message in errors[:3]:
+                self._label(self.quota_container, message, fg=self.colors["faint"], font=_font(8), anchor="w").pack(fill="x", pady=(0, 5))
+        if not rendered:
+            message = errors[0] if errors else "No provider quota was returned."
             self._label(self.quota_container, message, fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=6)
 
     def _render_session(self) -> None:
@@ -780,14 +1037,23 @@ class UsageWidget:
     def _render_models(self) -> None:
         if self.layout != "full" or self.models_container is None:
             return
+        scroll_fraction = 0.0
+        if self.models_canvas is not None:
+            view = self.models_canvas.yview()
+            if view:
+                scroll_fraction = float(view[0])
         for child in self.models_container.winfo_children():
             child.destroy()
         models_snapshot = self.state.get("models") or {}
-        models = list(models_snapshot.get("models") or [])[:3]
-        total = sum(int(item.get("total_tokens") or 0) for item in (models_snapshot.get("models") or []))
-        self.models_total_var.set(f"{compact_number(total)} tracked" if total else "")
+        session = self.state.get("session") or {}
+        models = ordered_model_rows(models_snapshot, session.get("model"))
+        total = sum(int(item.get("total_tokens") or 0) for item in models)
+        self.models_total_var.set(
+            f"{len(models)} models · {compact_number(total)} processed" if models else ""
+        )
         if not models:
             self._label(self.models_container, "No model telemetry yet.", fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=8)
+            self._schedule_models_scroll_restore(scroll_fraction)
             return
         for index, item in enumerate(models):
             row = tk.Frame(
@@ -806,13 +1072,25 @@ class UsageWidget:
             details = f"in {compact_number(item.get('input_tokens'))} · out {compact_number(item.get('output_tokens'))} · cache {compact_number(item.get('cache_tokens'))}"
             self._label(left, details, bg=self.colors["card_alt"], fg=self.colors["faint"], font=_font(7), anchor="w").pack(anchor="w", pady=(2, 0))
             self._label(row, compact_number(item.get("total_tokens")), bg=self.colors["card_alt"], font=_font(10, "bold")).pack(side="right", padx=9)
+        self._schedule_models_scroll_restore(scroll_fraction)
 
     def _render_all(self) -> None:
-        providers = monitored_provider_labels(self.state)
-        self.monitored_providers_var.set(" · ".join(providers) if providers else "DETECTING…")
+        self.monitored_providers_var.set(monitored_provider_text(self.state))
         self._render_quota()
         self._render_session()
         self._render_models()
+
+    def _render_snapshot_targets(self, targets: set[str]) -> None:
+        if "providers" in targets:
+            self.monitored_providers_var.set(monitored_provider_text(self.state))
+        if "quota" in targets:
+            self._render_quota()
+        if "session" in targets:
+            self._render_session()
+        if "models" in targets:
+            self._render_models()
+        if "tray" in targets:
+            self._update_tray()
 
     def _create_tray(self) -> None:
         def command(name: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
@@ -823,7 +1101,7 @@ class UsageWidget:
         menu = pystray.Menu(
             pystray.MenuItem("Show / hide", command("toggle"), default=True),
             pystray.MenuItem("Refresh now", command("refresh")),
-            pystray.MenuItem("Weekly only", command("size"), checked=lambda _item: self.layout == "small"),
+            pystray.MenuItem("Compact view", command("size"), checked=lambda _item: self.layout == "small"),
             pystray.MenuItem("Open Grok usage", command("grok")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Always on top", command("topmost"), checked=lambda _item: bool(self.settings["always_on_top"])),
@@ -831,11 +1109,14 @@ class UsageWidget:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", command("quit")),
         )
-        self.tray = pystray.Icon(APP_ID, _tray_image(None), APP_NAME, menu)
+        self.tray = _DaemonTrayIcon(APP_ID, _tray_image(None), APP_NAME, menu)
         self.tray.run_detached()
 
     def _poll_loop(self) -> None:
-        next_session = next_models = next_quota = next_grok_quota = 0.0
+        next_session = next_models = next_provider_quotas = 0.0
+        latest_session: dict[str, Any] = {}
+        latest_models: dict[str, Any] = {}
+        quota_context: tuple[tuple[str, str], ...] = ()
         while not self.stop_event.is_set():
             now = time.monotonic()
             forced = self.force_all
@@ -843,24 +1124,27 @@ class UsageWidget:
             snapshot: dict[str, Any] = {}
             try:
                 if forced or now >= next_session:
-                    snapshot["session"] = self.data.fetch_session()
+                    latest_session = self.data.fetch_session()
+                    snapshot["session"] = latest_session
                     next_session = now + (10.0 if self.visible else 60.0)
                 if forced or now >= next_models:
-                    snapshot["models"] = self.data.fetch_models()
-                    next_models = now + (120.0 if self.visible else 600.0)
-                if forced or now >= next_quota:
-                    snapshot["quota"] = self.data.fetch_quota()
-                    next_quota = now + (300.0 if self.visible else 900.0)
-                if forced or now >= next_grok_quota:
-                    snapshot["grok_quota"] = self.data.fetch_grok_quota()
-                    next_grok_quota = now + (300.0 if self.visible else 900.0)
+                    latest_models = self.data.fetch_models()
+                    snapshot["models"] = latest_models
+                    next_models = now + (15.0 if self.visible else 120.0)
+                current_context = self.data.provider_context_key(latest_session, latest_models)
+                if current_context != quota_context:
+                    next_provider_quotas = 0.0
+                if forced or now >= next_provider_quotas:
+                    snapshot["provider_quotas"] = self.data.fetch_provider_quotas(latest_session, latest_models)
+                    quota_context = current_context
+                    next_provider_quotas = now + (300.0 if self.visible else 900.0)
                 if snapshot:
                     snapshot["collected_at"] = time.time()
                     self.events.put(("snapshot", snapshot))
             except Exception:
                 logging.exception("Usage polling failed")
                 self.events.put(("error", "Collector offline — retrying"))
-            wait_until = min(next_session, next_models, next_quota, next_grok_quota)
+            wait_until = min(next_session, next_models, next_provider_quotas)
             timeout = max(0.5, min(60.0, wait_until - time.monotonic()))
             self.refresh_event.wait(timeout)
             self.refresh_event.clear()
@@ -870,7 +1154,8 @@ class UsageWidget:
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == "snapshot":
-                    for key in ("quota", "grok_quota", "session", "models"):
+                    render_targets = snapshot_render_targets(self.state, payload)
+                    for key in ("provider_quotas", "session", "models"):
                         if key in payload:
                             self.state[key] = payload[key]
                     self.last_updated = float(payload.get("collected_at") or time.time())
@@ -878,9 +1163,8 @@ class UsageWidget:
                     self._sync_status()
                     if self.layout == "full":
                         timestamp = time.strftime("%I:%M %p", time.localtime(self.last_updated)).lstrip("0")
-                        self.footer_var.set(f"Quota from ChatGPT + Grok · tokens from Hermes · {timestamp}")
-                    self._render_all()
-                    self._update_tray()
+                        self.footer_var.set(f"Quota from providers · tokens from Hermes · {timestamp}")
+                    self._render_snapshot_targets(render_targets)
                 elif kind == "error":
                     self.last_error = str(payload)
                     self.status_dot.itemconfigure("dot", fill=self.colors["red"])
@@ -895,7 +1179,14 @@ class UsageWidget:
     def _update_tray(self) -> None:
         if not self.tray:
             return
-        limit = choose_current_limit(self.state.get("quota"), (self.state.get("session") or {}).get("model"))
+        model = (self.state.get("session") or {}).get("model")
+        providers = [
+            provider
+            for provider in (self.state.get("provider_quotas") or {}).get("providers") or []
+            if isinstance(provider, dict)
+        ]
+        preferred = next((provider for provider in providers if provider.get("id") == "codex"), None)
+        limit = choose_current_limit(preferred or (providers[0] if providers else None), model)
         remaining = float(limit.get("remaining_percent")) if limit and limit.get("remaining_percent") is not None else None
         self.tray.icon = _tray_image(remaining)
         self.tray.title = tray_usage_title(self.state)
@@ -962,6 +1253,7 @@ class UsageWidget:
         self.events.put(("command", command))
 
     def _begin_drag(self, event: tk.Event[Any]) -> None:
+        self.resize_origin = None
         self.drag_origin = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
 
     def _drag(self, event: tk.Event[Any]) -> None:
@@ -976,6 +1268,50 @@ class UsageWidget:
         self.drag_origin = None
         self.settings["window_x"] = self.root.winfo_x()
         self.settings["window_y"] = self.root.winfo_y()
+        _save_settings(self.settings)
+
+    def _begin_resize(self, event: tk.Event[Any], edge: str) -> None:
+        self.drag_origin = None
+        self.resize_origin = (
+            edge,
+            event.x_root,
+            event.y_root,
+            self.root.winfo_x(),
+            self.root.winfo_y(),
+            max(1, self.root.winfo_width()),
+            max(1, self.root.winfo_height()),
+        )
+
+    def _resize(self, event: tk.Event[Any]) -> None:
+        if self.resize_origin is None:
+            return
+        edge, start_px, start_py, start_x, start_y, start_w, start_h = self.resize_origin
+        min_w, min_h = MIN_SIZES.get(self.layout, MIN_SIZES["full"])
+        x, y, width, height = compute_resized_geometry(
+            edge,
+            start_x=start_x,
+            start_y=start_y,
+            start_w=start_w,
+            start_h=start_h,
+            pointer_dx=event.x_root - start_px,
+            pointer_dy=event.y_root - start_py,
+            min_w=min_w,
+            min_h=min_h,
+            work_area=_work_area(),
+        )
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _end_resize(self, _event: tk.Event[Any]) -> None:
+        if self.resize_origin is None:
+            return
+        self.resize_origin = None
+        width = max(1, self.root.winfo_width())
+        height = max(1, self.root.winfo_height())
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        sizes = normalize_window_sizes(self.settings.get("sizes"))
+        sizes[self.layout] = [width, height]
+        self.settings.update({"window_x": x, "window_y": y, "sizes": sizes, "layout": self.layout})
         _save_settings(self.settings)
 
     def quit(self) -> None:
