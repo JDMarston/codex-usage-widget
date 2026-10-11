@@ -60,7 +60,7 @@ class UsageView:
             label.configure(text=value)
         label.bind("<Configure>", resize)
         self.tip(label, text)
-        label.after_idle(resize)
+        self.root.after_idle(resize)
 
     def build(self):
         h, p = self.host, self.host.px
@@ -246,7 +246,7 @@ class UsageView:
                         widget.create_rectangle(0, 0, widget.winfo_width() * value / 100, widget.winfo_height(),
                                                 fill=self.c["faint"] if stale else h._quota_color(value), outline="")
                 bar.bind("<Configure>", draw)
-                bar.after_idle(draw)
+                self.root.after_idle(draw)
                 self.bar_widgets.append(bar)
                 self.tip(bar, h.quota_tooltip(limit, provider))
                 reset = self.label(inside, "", size=10, color=self.c["muted"], anchor="w")
