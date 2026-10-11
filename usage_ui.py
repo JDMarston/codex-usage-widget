@@ -300,15 +300,20 @@ class UsageView:
             self.model_rows.append(row)
 
     def tick(self):
+        def update(widget, **values):
+            changed = {key: value for key, value in values.items() if str(widget.cget(key)) != str(value)}
+            if changed:
+                widget.configure(**changed)
+
         h = self.host
         providers = (h.state.get("provider_quotas") or {}).get("providers") or []
         names = " · ".join(p["label"] for p in providers)
-        self.subtitle.configure(text="Hermes  /  Token history" if self.view == "history" else (names + "  /  Account limits") if names else "Account limits")
-        self.refresh_button.configure(state="disabled" if h.refreshing else "normal")
+        update(self.subtitle, text="Hermes  /  Token history" if self.view == "history" else (names + "  /  Account limits") if names else "Account limits")
+        update(self.refresh_button, state="disabled" if h.refreshing else "normal")
         for label, provider in self.freshness:
             if label.winfo_exists():
-                label.configure(text=h.freshness(provider), fg=self.c["orange"] if provider.get("stale") or provider.get("status") in {"error", "auth_required"} else self.c["muted"])
+                update(label, text=h.freshness(provider), fg=self.c["orange"] if provider.get("stale") or provider.get("status") in {"error", "auth_required"} else self.c["muted"])
         for label, limit in self.resets:
             if label.winfo_exists():
-                label.configure(text=h.reset_caption(limit))
-        self.footer.configure(text="Refreshing account limits…" if h.refreshing else "Hermes history · refreshed locally" if self.view == "history" else "Auto-refresh 3 min · bars show remaining")
+                update(label, text=h.reset_caption(limit))
+        update(self.footer, text="Refreshing account limits…" if h.refreshing else "Hermes history · refreshed locally" if self.view == "history" else "Auto-refresh 3 min · bars show remaining")

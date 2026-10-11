@@ -104,10 +104,25 @@ class NativeViewTests(unittest.TestCase):
                 self.assertAlmostEqual(coords[2] / bar.winfo_width(), expected)
             footer = self.widget.ui.footer
             self.assertLessEqual(footer.winfo_rooty()+footer.winfo_height(), self.root.winfo_rooty()+self.root.winfo_height())
-        self.widget.ui.switch('history'); self.settle()
+        self.widget.ui.history_button.invoke(); self.settle()
         self.assertIn('Hermes-only history', self.texts())
-        self.widget.ui.switch('quota'); self.settle()
+        self.widget.ui.quota_button.invoke(); self.settle()
         self.assertIn('75% left', self.texts())
+
+    def test_unchanged_clock_tick_does_not_repaint_widgets(self):
+        self.widget.ui.tick()
+        targets = [self.widget.ui.subtitle, self.widget.ui.refresh_button, self.widget.ui.footer]
+        targets.extend(label for label, _ in self.widget.ui.freshness)
+        targets.extend(label for label, _ in self.widget.ui.resets)
+        patches = [patch.object(widget, 'configure', wraps=widget.configure) for widget in targets]
+        mocks = [item.start() for item in patches]
+        try:
+            self.widget.ui.tick()
+            for configured in mocks:
+                configured.assert_not_called()
+        finally:
+            for item in patches:
+                item.stop()
 
     def test_not_reported_and_failures_visible_in_compact(self):
         self.widget.state['provider_quotas']['providers'][1] = normalize_provider('grok', {
