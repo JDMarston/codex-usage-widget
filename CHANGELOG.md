@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1
+
+- Fix cross-monitor jumping on displays left of or above the primary screen. All drag, resize, restored-position and tooltip paths now use absolute Tk coordinates, not right/bottom-edge anchors.
+- Keep tooltips on the pointer's monitor and use the live window's monitor when changing size.
+- Defer visual refreshes during a drag/resize while continuing to collect data; dismiss hover popups when movement begins.
+- Keep deferred drawing callbacks owned by the root so immediate shutdown cannot double-delete Tk commands.
+- Add mapped-window regression tests and a repeatable source-window multi-monitor motion check. No layout redesign or new runtime dependencies.
+
 ## 2.0.0
 
 ### Quota reliability

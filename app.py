@@ -26,7 +26,7 @@ from data_client import HermesUsageData, merge_provider
 from usage_ui import UsageView
 
 APP_NAME = "API Usage"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 APP_ID = "CodexUsageWidget"
 IPC_PORT = 47631
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -237,6 +237,17 @@ def layout_dimensions(layout: str, sizes: Any | None = None) -> tuple[int, int]:
     name = layout if layout in SIZES else "full"
     width, height = normalized[name]
     return int(width), int(height)
+
+
+def absolute_geometry(x: int, y: int, width: int | None = None, height: int | None = None) -> str:
+    """Tk's leading sign is an anchor, not the coordinate's arithmetic sign.
+
+    + followed by a negative offset (e.g. '+-800') means an absolute position
+    left/above the primary origin. '-800' means 800 from the right/bottom edge.
+    Keep every positioning path in the same virtual-desktop coordinate space.
+    """
+    size = f"{int(width)}x{int(height)}" if width is not None and height is not None else ""
+    return f"{size}+{int(x)}+{int(y)}"
 
 
 def compute_resized_geometry(
@@ -533,6 +544,7 @@ class UsageWidget:
         self.quitting = False
         self.refreshing = False
         self.drag_origin = self.resize_origin = None
+        self._render_pending = False
         self.tooltip_window = None
         self.tray = None
         self.last_error = None
@@ -615,7 +627,7 @@ class UsageWidget:
     def _tick(self):
         if self.quitting:
             return
-        if self.visible:
+        if self.visible and self.drag_origin is None and self.resize_origin is None:
             self.ui.tick()
         self.root.after(1000 if self.visible else 15000, self._tick)
 
@@ -713,10 +725,15 @@ class UsageWidget:
         except queue.Empty:
             pass
         if not self.quitting:
-            if redraw:
-                self.ui.render()
+            self._render_pending |= redraw
+            # Keep collecting in the background, but do not rebuild/reflow the
+            # UI underneath an active drag or edge resize. Flush on release.
+            if self.drag_origin is None and self.resize_origin is None:
+                if self._render_pending:
+                    self._render_pending = False
+                    self.ui.render()
+                self.ui.tick()
             self._update_tray()
-            self.ui.tick()
             self.root.after(200 if self.visible else 1000, self._drain_events)
 
     def _update_tray(self):
@@ -823,7 +840,9 @@ class UsageWidget:
         old_x = self.root.winfo_x() if not initial else None
         old_y = self.root.winfo_y() if not initial else None
         width, height = layout_dimensions(self.layout, self.settings.get("sizes"))
-        left, top, right, bottom = _work_area(self.settings.get("window_x"), self.settings.get("window_y"))
+        position_x = self.settings.get("window_x") if initial else old_x
+        position_y = self.settings.get("window_y") if initial else old_y
+        left, top, right, bottom = _work_area(position_x, position_y)
         saved_x = self.settings.get("window_x")
         saved_y = self.settings.get("window_y")
         if initial and isinstance(saved_x, int) and isinstance(saved_y, int):
@@ -835,7 +854,7 @@ class UsageWidget:
             x, y = right - width - 18, bottom - height - 18
         x = min(max(left, int(x)), max(left, right - width))
         y = min(max(top, int(y)), max(top, bottom - height))
-        self.root.geometry(f"{width}x{height}{x:+d}{y:+d}")
+        self.root.geometry(absolute_geometry(x, y, width, height))
         sizes = normalize_window_sizes(self.settings.get("sizes"))
         sizes[self.layout] = [width, height]
         self.settings.update({"layout": self.layout, "window_x": x, "window_y": y, "sizes": sizes})
@@ -899,9 +918,11 @@ class UsageWidget:
         )
         label.pack()
         window.update_idletasks()
-        x = min(self.root.winfo_pointerx() + 12, self.root.winfo_screenwidth() - window.winfo_reqwidth() - 4)
-        y = min(self.root.winfo_pointery() + 14, self.root.winfo_screenheight() - window.winfo_reqheight() - 4)
-        window.geometry(f"+{max(0, x)}+{max(0, y)}")
+        pointer_x, pointer_y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        left, top, right, bottom = _work_area(pointer_x, pointer_y)
+        x = max(left, min(pointer_x + 12, right - window.winfo_reqwidth() - 4))
+        y = max(top, min(pointer_y + 14, bottom - window.winfo_reqheight() - 4))
+        window.geometry(absolute_geometry(x, y))
         window.deiconify()
 
     def _hide_tooltip(self) -> None:
@@ -934,6 +955,7 @@ class UsageWidget:
         self.tray.run_detached()
 
     def _begin_drag(self, event: tk.Event[Any]) -> None:
+        self._hide_tooltip()
         self.resize_origin = None
         self.drag_origin = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
 
@@ -941,7 +963,7 @@ class UsageWidget:
         if self.drag_origin is None:
             return
         start_x, start_y, window_x, window_y = self.drag_origin
-        self.root.geometry(f"{window_x + event.x_root - start_x:+d}{window_y + event.y_root - start_y:+d}")
+        self.root.geometry(absolute_geometry(window_x + event.x_root - start_x, window_y + event.y_root - start_y))
 
     def _end_drag(self, _event: tk.Event[Any]) -> None:
         if self.drag_origin is None:
@@ -952,6 +974,7 @@ class UsageWidget:
         _save_settings(self.settings)
 
     def _begin_resize(self, event: tk.Event[Any], edge: str) -> None:
+        self._hide_tooltip()
         self.drag_origin = None
         self.resize_origin = (
             edge,
@@ -980,7 +1003,7 @@ class UsageWidget:
             min_h=min_h,
             work_area=_work_area(start_x, start_y),
         )
-        self.root.geometry(f"{width}x{height}{x:+d}{y:+d}")
+        self.root.geometry(absolute_geometry(x, y, width, height))
 
     def _end_resize(self, _event: tk.Event[Any]) -> None:
         if self.resize_origin is None:
