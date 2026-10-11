@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import shutil
+import hashlib
+import json
 import subprocess
 import sys
 import os
 from pathlib import Path
 
-from app import _tray_image
+from app import VERSION, _tray_image
 
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
@@ -43,7 +45,7 @@ def main() -> int:
         "--add-data",
         f"{ROOT / 'gemini_quota_worker.py'};.",
         "--add-data",
-        f"{ROOT / 'hermes-plugin'};hermes-plugin",
+        f"{ROOT / 'hermes-plugin' / 'plugins' / 'codex-usage' / 'dashboard' / 'plugin_api.py'};hermes-plugin/plugins/codex-usage/dashboard",
         "--hidden-import",
         "pystray._win32",
         "--exclude-module",
@@ -62,9 +64,19 @@ def main() -> int:
     output = APP_DIR / "CodexUsageWidget.exe"
     if not output.exists():
         raise RuntimeError("PyInstaller did not produce CodexUsageWidget.exe")
-    archive = shutil.make_archive(str(DIST / "CodexUsageWidget-windows-x64"), "zip", root_dir=APP_DIR)
+    for name in ("LICENSE", "README.md", "CHANGELOG.md", "install.ps1"):
+        shutil.copy2(ROOT / name, APP_DIR / name)
+    manifest = {"version": VERSION, "files": [
+        {"path": path.relative_to(APP_DIR).as_posix(), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for path in sorted(APP_DIR.rglob("*")) if path.is_file()
+    ]}
+    (APP_DIR / "build-info.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    archive = Path(shutil.make_archive(str(DIST / "CodexUsageWidget-windows-x64"), "zip", root_dir=APP_DIR))
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    archive.with_suffix(".zip.sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
     print(output)
     print(archive)
+    print(f"SHA256 {digest}")
     return 0
 
 

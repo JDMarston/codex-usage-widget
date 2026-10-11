@@ -38,7 +38,7 @@ class FormattingTests(unittest.TestCase):
     def test_quota_tooltip_uses_reported_period_start_and_next_reset(self) -> None:
         limit = {"used_percent": 24.6, "period_start_at": 1_000, "reset_at": 2_000}
         text = quota_tooltip_text(limit, formatter=lambda value: f"time-{value}")
-        self.assertEqual(text, "25% used\nLast reset: time-1000\nNext reset: time-2000")
+        self.assertEqual(text, "24.6% used\nLast reset: time-1000\nNext reset: time-2000")
 
     def test_quota_tooltip_derives_last_reset_from_window_length(self) -> None:
         limit = {"used_percent": 40, "reset_at": 700_000, "window_seconds": 604_800}
@@ -175,7 +175,7 @@ class FormattingTests(unittest.TestCase):
 
     def test_layout_dimensions_uses_saved_custom_size(self) -> None:
         self.assertEqual(layout_dimensions("full", {"full": [420, 800]}), (420, 800))
-        self.assertEqual(layout_dimensions("small"), (330, 225))
+        self.assertEqual(layout_dimensions("small"), (340, 330))
 
     def test_compute_resized_geometry_south_east(self) -> None:
         x, y, width, height = compute_resized_geometry(

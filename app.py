@@ -4,6 +4,8 @@ import argparse
 import ctypes
 import json
 import logging
+import math
+from logging.handlers import RotatingFileHandler
 import os
 import queue
 import socket
@@ -20,13 +22,15 @@ from typing import Any, Callable
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
-from data_client import HermesUsageData
+from data_client import HermesUsageData, merge_provider
+from usage_ui import UsageView
 
-APP_NAME = "Codex Usage Widget"
+APP_NAME = "API Usage"
+VERSION = "2.0.0"
 APP_ID = "CodexUsageWidget"
 IPC_PORT = 47631
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-SIZES = {"full": (382, 710), "small": (330, 225)}
+SIZES = {"full": (410, 500), "small": (340, 330)}
 GROK_USAGE_URL = "https://grok.com/?_s=usage"
 RESIZE_BORDER = 6
 MIN_SIZES = {"full": (320, 480), "small": (280, 180)}
@@ -47,7 +51,8 @@ SETTINGS_PATH = APP_DATA / "settings.json"
 LOG_PATH = APP_DATA / "widget.log"
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", LOCAL_APP_DATA / "hermes"))
 APP_DATA.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(handlers=[RotatingFileHandler(LOG_PATH, maxBytes=200_000, backupCount=2)],
+                    level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def compact_number(value: Any) -> str:
@@ -62,7 +67,14 @@ def compact_number(value: Any) -> str:
 
 def percent(value: Any) -> str:
     try:
-        return f"{round(float(value))}%"
+        number = float(value)
+        if not math.isfinite(number):
+            return "—"
+        if 0 < number < 0.1:
+            return "<0.1%"
+        if 99.9 < number < 100:
+            return ">99.9%"
+        return f"{number:.1f}".rstrip("0").rstrip(".") + "%"
     except (TypeError, ValueError):
         return "—"
 
@@ -128,11 +140,13 @@ def _model_key(value: Any) -> str:
 def choose_current_limit(quota: dict[str, Any] | None, model: Any) -> dict[str, Any] | None:
     limits = list((quota or {}).get("limits") or [])
     wanted = _model_key(model)
-    for limit in limits:
-        group = _model_key(limit.get("group"))
-        if limit.get("kind") == "model" and wanted and group and (wanted in group or group in wanted):
-            return limit
-    return next((item for item in limits if item.get("kind") == "account"), limits[0] if limits else None)
+    matched = [item for item in limits if item.get("kind") == "model" and wanted
+               and _model_key(item.get("group")) and
+               (wanted in _model_key(item.get("group")) or _model_key(item.get("group")) in wanted)]
+    account = [item for item in limits if item.get("kind") == "account"]
+    candidates = matched + account or limits
+    # The first window is not necessarily the one that will block the user.
+    return max(candidates, key=lambda item: float(item.get("used_percent") or 0)) if candidates else None
 
 
 def visible_limits(quota: dict[str, Any] | None, model: Any, maximum: int = 2) -> list[dict[str, Any]]:
@@ -189,16 +203,15 @@ def monitored_provider_text(state: dict[str, Any]) -> str:
 
 
 def tray_usage_title(state: dict[str, Any]) -> str:
-    parts: list[str] = []
-    model = (state.get("session") or {}).get("model")
+    parts = []
     for provider in (state.get("provider_quotas") or {}).get("providers") or []:
-        if not isinstance(provider, dict):
-            continue
-        limit = choose_current_limit(provider, model)
+        limit = choose_current_limit(provider, (state.get("session") or {}).get("model"))
+        label = str(provider.get("label") or "Provider")
         if limit and limit.get("remaining_percent") is not None:
-            label = str(provider.get("label") or provider.get("id") or "Provider")
-            parts.append(f"{label} {percent(limit['remaining_percent'])} left")
-    return f"API Usage — {' · '.join(parts)}" if parts else "API Usage"
+            parts.append(f"{label} {percent(limit['remaining_percent'])} left" + (" (stale)" if provider.get("stale") else ""))
+        else:
+            parts.append(f"{label}: " + {"not_reported": "not reported", "loading": "checking", "auth_required": "sign-in needed"}.get(provider.get("status"), "unavailable"))
+    return (f"API Usage — {' · '.join(parts)}" if parts else "API Usage")[:127]
 
 
 def normalize_window_sizes(raw: Any) -> dict[str, list[int]]:
@@ -398,12 +411,24 @@ def set_startup(enabled: bool) -> None:
                 pass
 
 
-def _work_area() -> tuple[int, int, int, int]:
+def _work_area(x=None, y=None) -> tuple[int, int, int, int]:
     class Rect(ctypes.Structure):
         _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
     rect = Rect()
     try:
+        if isinstance(x, int) and isinstance(y, int):
+            from ctypes import wintypes
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = [("size", wintypes.DWORD), ("monitor", Rect), ("work", Rect), ("flags", wintypes.DWORD)]
+            user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            user32.MonitorFromPoint.restype = wintypes.HANDLE
+            user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+            monitor = user32.MonitorFromPoint(wintypes.POINT(x, y), 2)
+            info = MonitorInfo(size=ctypes.sizeof(MonitorInfo))
+            if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                return info.work.left, info.work.top, info.work.right, info.work.bottom
         if ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0):
             return rect.left, rect.top, rect.right, rect.bottom
     except Exception:
@@ -423,7 +448,7 @@ def _tray_image(remaining: float | None) -> Image.Image:
         font = ImageFont.truetype(str(Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "segoeuib.ttf"), 25)
     except OSError:
         font = ImageFont.load_default()
-    draw.text((32, 31), "C", fill="#f2f4fa", font=font, anchor="mm")
+    draw.text((32, 31), "U", fill="#f2f4fa", font=font, anchor="mm")
     return image
 
 
@@ -459,8 +484,12 @@ class IpcServer:
                 except socket.timeout:
                     continue
                 with connection:
-                    command = connection.recv(32).decode("ascii", errors="ignore").strip().upper()
-                    if command in {"SHOW", "QUIT"}:
+                    connection.settimeout(0.5)
+                    try:
+                        command = connection.recv(32).decode("ascii", errors="ignore").strip().upper()
+                    except socket.timeout:
+                        continue
+                    if command in {"SHOW", "QUIT", "REFRESH", "SIZE", "HIDE", "HISTORY", "QUOTA"}:
                         self.callback(command.lower())
         except OSError:
             if not self.stop_event.is_set():
@@ -489,57 +518,304 @@ def signal_existing_instance(command: str = "SHOW") -> bool:
 
 
 class UsageWidget:
-    def __init__(self, root: tk.Tk, *, start_hidden: bool) -> None:
+    def __init__(self, root: tk.Tk, *, start_hidden: bool, start_polling: bool = True, create_tray: bool = True) -> None:
         self.root = root
+        self.scale = max(1.0, root.winfo_fpixels("1i") / 96.0)
         self.settings = _load_settings()
-        self.layout = str(self.settings["layout"])
-        self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        if self.settings.get("layout_version") != 2:
+            self.settings.update(layout_version=2, sizes={k: [self.px(w), self.px(h)] for k, (w, h) in SIZES.items()})
+        self.layout = self.settings["layout"]
+        self.events: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.refresh_event = threading.Event()
         self.force_all = True
         self.visible = not start_hidden
         self.quitting = False
-        self.drag_origin: tuple[int, int, int, int] | None = None
-        self.resize_origin: tuple[str, int, int, int, int, int, int] | None = None
+        self.refreshing = False
+        self.drag_origin = self.resize_origin = None
+        self.tooltip_window = None
+        self.tray = None
+        self.last_error = None
         self.state: dict[str, Any] = {"provider_quotas": None, "session": None, "models": None}
-        self.last_updated: float | None = None
-        self.last_error: str | None = None
-        self.tray: pystray.Icon | None = None
-        self.tooltip_window: tk.Toplevel | None = None
         self.data = HermesUsageData(HERMES_HOME, resource_path("quota_worker.py"))
-
+        self._quota_thread = None
+        self._generation = 0
+        self._next_quota = 0.0
+        self._context = None
+        self._tray_signature = None
         dark = _system_uses_dark_mode()
         self.colors = {
-            "window": "#11131a" if dark else "#f4f5f8",
-            "card": "#191c26" if dark else "#ffffff",
-            "card_alt": "#151821" if dark else "#f8f9fb",
-            "text": "#f1f3f8" if dark else "#181a20",
-            "muted": "#9ba1b2" if dark else "#626979",
-            "faint": "#6e7485" if dark else "#8990a0",
-            "border": "#2b3040" if dark else "#d8dce5",
-            "accent": "#8c7cf0",
-            "green": "#46c785",
-            "orange": "#f0a64a",
-            "red": "#e65c67",
-            "track": "#2b3040" if dark else "#e0e3ea",
+            "window": "#10151d" if dark else "#f3f5f7", "card": "#19212c" if dark else "#ffffff",
+            "text": "#ecf0f5" if dark else "#172532", "muted": "#a7b4c5" if dark else "#536375",
+            "faint": "#8190a4" if dark else "#69788a", "border": "#2a3645" if dark else "#dbe2e9",
+            "track": "#303c4c" if dark else "#e5ebf0", "accent": "#74d8c0" if dark else "#16735f",
+            "green": "#74d8c0" if dark else "#16735f", "orange": "#f0be72" if dark else "#945a0b",
+            "red": "#f48d95" if dark else "#b43349",
         }
-
-        self.root.title(APP_NAME)
-        self.root.overrideredirect(True)
-        self.root.configure(bg=self.colors["window"])
-        self.root.attributes("-topmost", bool(self.settings["always_on_top"]))
-        self.root.protocol("WM_DELETE_WINDOW", self.hide)
-        self.root.bind("<Escape>", lambda _event: self.hide())
-
+        root.title(APP_NAME)
+        root.overrideredirect(True)
+        root.configure(bg=self.colors["window"])
+        root.attributes("-topmost", bool(self.settings["always_on_top"]))
+        root.protocol("WM_DELETE_WINDOW", self.hide)
+        root.bind("<Escape>", lambda _e: self.hide())
         self._set_geometry(initial=True)
-        self._build_ui()
-        self._create_tray()
-        self.root.after(120, self._drain_events)
-        threading.Thread(target=self._poll_loop, daemon=True, name="codex-usage-poller").start()
+        self.ui = UsageView(self)
+        if create_tray:
+            self._create_tray()
+        root.after(120, self._drain_events)
+        root.after(1000, self._tick)
         if start_hidden:
-            self.root.withdraw()
-        else:
+            root.withdraw()
+        if start_polling:
+            threading.Thread(target=self._poll_loop, daemon=True, name="usage-poller").start()
+
+    def px(self, value):
+        return max(1, round(value * self.scale))
+
+    number = staticmethod(compact_number)
+    format_percent = staticmethod(percent)
+
+    def model_rows(self):
+        return ordered_model_rows(self.state.get("models"), (self.state.get("session") or {}).get("model"))
+
+    def card_limits(self, provider, compact):
+        model = (self.state.get("session") or {}).get("model")
+        if compact:
+            limit = choose_current_limit(provider, model)
+            return [limit] if limit else []
+        return visible_limits(provider, model, maximum=20)
+
+    def _quota_color(self, remaining):
+        return self.colors["red"] if remaining < 10 else self.colors["orange"] if remaining < 30 else self.colors["green"]
+
+    def freshness(self, provider):
+        if provider.get("status") == "loading":
+            return "Checking…"
+        timestamp = provider.get("fetched_at")
+        if not timestamp:
+            return "Check failed"
+        age = max(0, int(time.time() - timestamp))
+        prefix = "Stale · " if provider.get("stale") else "Checked "
+        text = "now" if age < 60 else f"{age // 60}m ago" if age < 3600 else f"{age // 3600}h ago"
+        return prefix + text
+
+    def quota_tooltip(self, limit, provider):
+        return quota_tooltip_text(limit) + "\n" + self.freshness(provider)
+
+    def reset_caption(self, limit):
+        if limit.get("usage_text"):
+            return str(limit["usage_text"])
+        end = limit.get("reset_at")
+        if end is None:
+            return "Reset time not reported"
+        if float(end) <= time.time():
+            return "Reset due · awaiting provider update"
+        return reset_text(end).capitalize()
+
+    def _tick(self):
+        if self.quitting:
+            return
+        if self.visible:
+            self.ui.tick()
+        self.root.after(1000 if self.visible else 15000, self._tick)
+
+    def _poll_loop(self):
+        next_session = next_models = 0.0
+        latest_session, latest_models = {}, {}
+        while not self.stop_event.is_set():
+            now = time.monotonic()
+            force = self.force_all
+            self.force_all = False
+            self.refresh_event.clear()
+            try:
+                snapshot = {}
+                if force or now >= next_session:
+                    latest_session = self.data.fetch_session()
+                    snapshot["session"] = latest_session
+                    next_session = now + (10 if self.visible else 60)
+                if force or now >= next_models:
+                    latest_models = self.data.fetch_models()
+                    snapshot["models"] = latest_models
+                    next_models = now + (60 if self.visible else 180)
+                if snapshot:
+                    self.events.put(("snapshot", snapshot))
+                roster = self.data.configured_provider_ids()
+                context = tuple((p, model if p == "gemini" else "") for p, model in self.data.provider_context_key(latest_session, latest_models))
+                if context != self._context:
+                    self._context = context
+                    self._generation += 1
+                    self._next_quota = 0
+                    self.events.put(("roster", (self._generation, roster)))
+                busy = self._quota_thread is not None and self._quota_thread.is_alive()
+                if (force or now >= self._next_quota) and not busy:
+                    generation = self._generation
+                    self.events.put(("refresh_start", None))
+                    self._quota_thread = threading.Thread(target=self._collect_quotas,
+                        args=(generation, latest_session, latest_models), daemon=True, name="usage-refresh")
+                    self._quota_thread.start()
+            except Exception:
+                logging.exception("Usage poll failed")
+                self.events.put(("error", "Local telemetry unavailable"))
+            self.refresh_event.wait(1 if force else (5 if self.visible else 30))
+
+    def _collect_quotas(self, generation, session, models):
+        try:
+            snapshot = self.data.fetch_provider_quotas(session, models,
+                on_provider=lambda item: self.events.put(("provider", (generation, item))))
+            retry = any(p.get("status") in {"error", "auth_required"} for p in snapshot["providers"])
+            interval = 60 if retry else (180 if self.visible else 600)
+            future_resets = [limit["reset_at"] - time.time() + 2 for provider in snapshot["providers"]
+                             for limit in provider.get("limits", [])
+                             if isinstance(limit.get("reset_at"), (int, float)) and limit["reset_at"] > time.time()]
+            if future_resets:
+                interval = min(interval, min(future_resets))
+            self._next_quota = time.monotonic() + interval if generation == self._generation else 0
+        except Exception:
+            logging.exception("Quota refresh failed")
+            self._next_quota = time.monotonic() + 60
+        finally:
+            self.events.put(("refresh_done", generation))
+
+    def _drain_events(self):
+        redraw = False
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "snapshot":
+                    changed = snapshot_render_targets(self.state, payload)
+                    self.state.update(payload)
+                    redraw |= self.ui.view == "history" and bool(changed & {"models", "session"})
+                    if "quota" in changed:
+                        redraw = True
+                elif kind == "roster":
+                    _generation, roster = payload
+                    previous = {p["id"]: p for p in (self.state.get("provider_quotas") or {}).get("providers", [])}
+                    self.state["provider_quotas"] = {"providers": [previous.get(p) or {"id": p, "label": p.title(), "status": "loading", "limits": []} for p in roster]}
+                    redraw = True
+                elif kind == "provider":
+                    generation, provider = payload
+                    if generation != self._generation:
+                        continue
+                    providers = (self.state.get("provider_quotas") or {}).get("providers", [])
+                    for index, prior in enumerate(providers):
+                        if prior["id"] == provider["id"]:
+                            providers[index] = merge_provider(prior, provider)
+                            redraw = self.ui.view == "quota" or redraw
+                            break
+                elif kind == "refresh_start":
+                    self.refreshing = True
+                elif kind == "refresh_done":
+                    self.refreshing = False
+                elif kind == "command":
+                    self._handle_command(payload)
+                elif kind == "error":
+                    self.last_error = payload
+        except queue.Empty:
+            pass
+        if not self.quitting:
+            if redraw:
+                self.ui.render()
+            self._update_tray()
+            self.ui.tick()
+            self.root.after(200 if self.visible else 1000, self._drain_events)
+
+    def _update_tray(self):
+        if not self.tray:
+            return
+        title = tray_usage_title(self.state)
+        providers = (self.state.get("provider_quotas") or {}).get("providers", [])
+        limits = [choose_current_limit(p, (self.state.get("session") or {}).get("model")) for p in providers if not p.get("stale")]
+        values = [x["remaining_percent"] for x in limits if x and x.get("remaining_percent") is not None]
+        remaining = min(values) if values else None
+        signature = (title, remaining)
+        if signature != self._tray_signature:
+            self.tray.title = title
+            self.tray.icon = _tray_image(remaining)
+            self._tray_signature = signature
+
+    def _handle_command(self, command):
+        if command == "toggle":
+            self.hide() if self.visible else self.show()
+        elif command == "refresh":
+            self.refresh_now()
+        elif command == "size":
+            self.toggle_size()
+        elif command in {"history", "quota"}:
+            self.ui.switch(command)
+        elif command == "grok":
+            self.open_grok_usage()
+        elif command == "topmost":
+            self.settings["always_on_top"] = not bool(self.settings["always_on_top"])
+            self.root.attributes("-topmost", self.settings["always_on_top"])
+            _save_settings(self.settings)
+        elif command == "startup":
+            try:
+                set_startup(not startup_enabled())
+            except OSError:
+                logging.exception("Startup preference failed")
+        elif command == "show":
             self.show()
+        elif command == "hide":
+            self.hide()
+        elif command == "quit":
+            self.quit()
+        if self.tray:
+            self.tray.update_menu()
+
+    def toggle_size(self):
+        self.layout = "small" if self.layout == "full" else "full"
+        self._set_geometry()
+        self.ui.build()
+        if self.tray:
+            self.tray.update_menu()
+
+    def refresh_now(self):
+        if self.refreshing:
+            return
+        self.refreshing = True
+        self.ui.tick()
+        self.force_all = True
+        self.refresh_event.set()
+
+    def show(self):
+        self.visible = True
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", bool(self.settings["always_on_top"]))
+        # Showing a fresh popup does not force another request. A stale hidden
+        # cadence does switch immediately back to the visible refresh budget.
+        providers = (self.state.get("provider_quotas") or {}).get("providers", [])
+        if any(time.time() - (p.get("checked_at") or 0) >= 180 for p in providers):
+            self._next_quota = 0
+        self.refresh_event.set()
+        self.ui.tick()
+
+    def hide(self):
+        self.visible = False
+        self._hide_tooltip()
+        self.root.withdraw()
+
+    def request_ipc(self, command):
+        self.events.put(("command", command))
+
+    def _sync_status(self):
+        self.ui.tick()
+
+    def quit(self):
+        if self.quitting:
+            return
+        self.quitting = True
+        self._hide_tooltip()
+        self.stop_event.set()
+        self.refresh_event.set()
+        self.data.close()
+        self.settings.update(window_x=self.root.winfo_x(), window_y=self.root.winfo_y())
+        _save_settings(self.settings)
+        if self.tray:
+            self.tray.stop()
+        for job in self.root.tk.call("after", "info"):
+            self.root.after_cancel(job)
+        self.root.destroy()
 
     def _set_geometry(self, *, initial: bool = False) -> None:
         old_width = self.root.winfo_width() if not initial else 0
@@ -547,7 +823,7 @@ class UsageWidget:
         old_x = self.root.winfo_x() if not initial else None
         old_y = self.root.winfo_y() if not initial else None
         width, height = layout_dimensions(self.layout, self.settings.get("sizes"))
-        left, top, right, bottom = _work_area()
+        left, top, right, bottom = _work_area(self.settings.get("window_x"), self.settings.get("window_y"))
         saved_x = self.settings.get("window_x")
         saved_y = self.settings.get("window_y")
         if initial and isinstance(saved_x, int) and isinstance(saved_y, int):
@@ -559,7 +835,7 @@ class UsageWidget:
             x, y = right - width - 18, bottom - height - 18
         x = min(max(left, int(x)), max(left, right - width))
         y = min(max(top, int(y)), max(top, bottom - height))
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.geometry(f"{width}x{height}{x:+d}{y:+d}")
         sizes = normalize_window_sizes(self.settings.get("sizes"))
         sizes[self.layout] = [width, height]
         self.settings.update({"layout": self.layout, "window_x": x, "window_y": y, "sizes": sizes})
@@ -572,21 +848,6 @@ class UsageWidget:
             )
         except Exception:
             pass
-
-    def _label(self, parent: tk.Misc, text: str = "", **kwargs: Any) -> tk.Label:
-        return tk.Label(
-            parent,
-            text=text,
-            bg=kwargs.pop("bg", parent.cget("bg")),
-            fg=kwargs.pop("fg", self.colors["text"]),
-            font=kwargs.pop("font", _font(10)),
-            borderwidth=0,
-            highlightthickness=0,
-            **kwargs,
-        )
-
-    def _section_title(self, parent: tk.Misc, text: str) -> tk.Label:
-        return self._label(parent, text.upper(), fg=self.colors["muted"], font=_font(8, "bold"), anchor="w")
 
     def _bind_drag(self, widget: tk.Misc) -> None:
         widget.bind("<ButtonPress-1>", self._begin_drag)
@@ -617,308 +878,6 @@ class UsageWidget:
             handle.bind("<B1-Motion>", self._resize)
             handle.bind("<ButtonRelease-1>", self._end_resize)
             handle.lift()
-
-    def _sync_models_scrollregion(self) -> None:
-        canvas = getattr(self, "models_canvas", None)
-        if canvas is None:
-            return
-        canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
-
-    def _restore_models_scroll(self, fraction: float) -> None:
-        self._sync_models_scrollregion()
-        canvas = getattr(self, "models_canvas", None)
-        if canvas is not None:
-            canvas.yview_moveto(max(0.0, min(1.0, fraction)))
-
-    def _schedule_models_scroll_restore(self, fraction: float) -> None:
-        # Packing fresh rows briefly shrinks the canvas window to zero height.
-        # Restore only after Tk has completed that geometry pass so a polling
-        # refresh does not snap a user who is browsing older models to the top.
-        self.root.after(75, lambda: self._restore_models_scroll(fraction))
-
-    def _on_models_canvas_configure(self, event: tk.Event[Any]) -> None:
-        canvas = getattr(self, "models_canvas", None)
-        window = getattr(self, "models_window", None)
-        if canvas is None or window is None:
-            return
-        canvas.itemconfigure(window, width=event.width)
-        self._sync_models_scrollregion()
-
-    def _on_models_mousewheel(self, event: tk.Event[Any]) -> str | None:
-        canvas = getattr(self, "models_canvas", None)
-        if canvas is None:
-            return None
-        delta = int(getattr(event, "delta", 0) or 0)
-        if not delta:
-            return None
-        canvas.yview_scroll(-int(delta / 120), "units")
-        return "break"
-
-    def _build_ui(self) -> None:
-        self._hide_tooltip()
-        for child in self.root.winfo_children():
-            child.destroy()
-
-        outer = tk.Frame(
-            self.root,
-            bg=self.colors["window"],
-            highlightbackground=self.colors["border"],
-            highlightthickness=1,
-        )
-        outer.pack(fill="both", expand=True)
-
-        body = tk.Frame(outer, bg=self.colors["window"])
-        body.pack(fill="both", expand=True)
-
-        header = tk.Frame(body, bg=self.colors["window"], height=58, cursor="fleur")
-        header.pack(fill="x", padx=15, pady=(12, 5))
-        header.pack_propagate(False)
-        self._bind_drag(header)
-
-        title_box = tk.Frame(header, bg=self.colors["window"])
-        title_box.pack(side="left", fill="y")
-        self._bind_drag(title_box)
-        title = self._label(title_box, "API USAGE", font=_font(11, "bold"), anchor="w")
-        title.pack(anchor="w")
-        self._bind_drag(title)
-
-        status_row = tk.Frame(title_box, bg=self.colors["window"])
-        status_row.pack(anchor="w", pady=(4, 0))
-        self._bind_drag(status_row)
-        monitored_models = tk.Frame(
-            status_row,
-            bg=self.colors["card"],
-            highlightbackground=self.colors["border"],
-            highlightthickness=1,
-        )
-        monitored_models.pack(side="left")
-        self.monitored_providers_var = tk.StringVar(value="DETECTING…")
-        monitored_label = self._label(
-            monitored_models,
-            textvariable=self.monitored_providers_var,
-            bg=self.colors["card"],
-            fg=self.colors["muted"],
-            font=_font(7, "bold"),
-        )
-        monitored_label.pack(padx=5, pady=2)
-        self._bind_drag(monitored_models)
-        self._bind_drag(monitored_label)
-        self.status_dot = tk.Canvas(status_row, width=8, height=8, bg=self.colors["window"], highlightthickness=0)
-        self.status_dot.pack(side="left", padx=(7, 0), pady=(2, 0))
-        self.status_dot.create_oval(1, 1, 7, 7, fill=self.colors["orange"], outline="", tags="dot")
-        self.status_var = tk.StringVar(value="Connecting to Hermes…")
-        status_label = self._label(status_row, textvariable=self.status_var, fg=self.colors["muted"], font=_font(8))
-        status_label.pack(side="left", padx=(6, 0))
-        self._bind_drag(status_label)
-
-        close_button = tk.Button(
-            header,
-            text="×",
-            command=self.hide,
-            bg=self.colors["window"],
-            fg=self.colors["muted"],
-            activebackground=self.colors["card"],
-            activeforeground=self.colors["text"],
-            borderwidth=0,
-            highlightthickness=0,
-            font=_font(15),
-            cursor="hand2",
-            width=2,
-        )
-        close_button.pack(side="right", anchor="n")
-
-        size_button = tk.Button(
-            header,
-            text="−" if self.layout == "full" else "□",
-            command=self.toggle_size,
-            bg=self.colors["window"],
-            fg=self.colors["muted"],
-            activebackground=self.colors["card"],
-            activeforeground=self.colors["text"],
-            borderwidth=0,
-            highlightthickness=0,
-            font=_font(14, "bold"),
-            cursor="hand2",
-            width=2,
-        )
-        size_button.pack(side="right", anchor="n", padx=(0, 2))
-
-        content = tk.Frame(body, bg=self.colors["window"])
-        content.pack(fill="both", expand=True, padx=15, pady=(0, 10 if self.layout == "full" else 8))
-
-        if self.layout == "small":
-            self.quota_container = tk.Frame(content, bg=self.colors["window"])
-            self.quota_container.pack(fill="x")
-            self.session_model_var = tk.StringVar(value="—")
-            self.metric_vars = {}
-            self.models_total_var = tk.StringVar(value="")
-            self.models_container = None
-            self.models_canvas = None
-            self.models_window = None
-            self.models_scrollbar = None
-            self.footer_var = tk.StringVar(value="")
-            self._render_quota()
-            self._sync_status()
-            self._install_resize_handles(outer)
-            return
-
-        self._section_title(content, "Account quota").pack(fill="x", pady=(0, 5))
-        self.quota_container = tk.Frame(content, bg=self.colors["window"])
-        self.quota_container.pack(fill="x")
-        self._render_loading_quota()
-
-        session_header = tk.Frame(content, bg=self.colors["window"])
-        session_header.pack(fill="x", pady=(12, 5))
-        self._section_title(session_header, "Current session spend").pack(side="left")
-        self.session_model_var = tk.StringVar(value="—")
-        self._label(
-            session_header,
-            textvariable=self.session_model_var,
-            fg=self.colors["faint"],
-            font=_font(8),
-        ).pack(side="right")
-
-        session_card = tk.Frame(
-            content,
-            bg=self.colors["card"],
-            highlightbackground=self.colors["border"],
-            highlightthickness=1,
-        )
-        session_card.pack(fill="x")
-        metrics = tk.Frame(session_card, bg=self.colors["card"])
-        metrics.pack(fill="x", padx=10, pady=9)
-        self.metric_vars: dict[str, tk.StringVar] = {}
-        for index, (key, label) in enumerate(
-            (("total", "PROCESSED"), ("input", "INPUT"), ("output", "OUTPUT"), ("calls", "CALLS"))
-        ):
-            cell = tk.Frame(metrics, bg=self.colors["card"])
-            cell.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 5, 0))
-            metrics.grid_columnconfigure(index, weight=1)
-            variable = tk.StringVar(value="—")
-            self.metric_vars[key] = variable
-            self._label(cell, textvariable=variable, bg=self.colors["card"], font=_font(12, "bold"), anchor="w").pack(anchor="w")
-            self._label(
-                cell,
-                label,
-                bg=self.colors["card"],
-                fg=self.colors["faint"],
-                font=_font(7, "bold"),
-                anchor="w",
-            ).pack(anchor="w", pady=(2, 0))
-
-        models_header = tk.Frame(content, bg=self.colors["window"])
-        models_header.pack(fill="x", pady=(12, 3))
-        self._section_title(models_header, "Models · all tracked").pack(side="left")
-        self.models_total_var = tk.StringVar(value="")
-        self._label(models_header, textvariable=self.models_total_var, fg=self.colors["faint"], font=_font(8)).pack(side="right")
-        models_shell = tk.Frame(content, bg=self.colors["window"])
-        models_shell.pack(fill="both", expand=True)
-        self.models_scrollbar = tk.Scrollbar(
-            models_shell,
-            orient="vertical",
-            command=lambda *args: self.models_canvas.yview(*args),
-            bg=self.colors["card"],
-            activebackground=self.colors["border"],
-            troughcolor=self.colors["window"],
-            width=9,
-            highlightthickness=0,
-        )
-        self.models_scrollbar.pack(side="right", fill="y")
-        self.models_canvas = tk.Canvas(
-            models_shell,
-            bg=self.colors["window"],
-            borderwidth=0,
-            highlightthickness=0,
-            yscrollcommand=self.models_scrollbar.set,
-        )
-        self.models_canvas.pack(side="left", fill="both", expand=True)
-        self.models_container = tk.Frame(self.models_canvas, bg=self.colors["window"])
-        self.models_window = self.models_canvas.create_window((0, 0), window=self.models_container, anchor="nw")
-        self.models_container.bind("<Configure>", lambda _event: self._sync_models_scrollregion())
-        self.models_canvas.bind("<Configure>", self._on_models_canvas_configure)
-        self.models_canvas.bind("<MouseWheel>", self._on_models_mousewheel)
-        self._label(
-            self.models_container,
-            "Loading model telemetry…",
-            fg=self.colors["muted"],
-            font=_font(9),
-            anchor="w",
-        ).pack(fill="x", pady=8)
-
-        footer = tk.Frame(body, bg=self.colors["window"])
-        footer.pack(fill="x", padx=15, pady=(0, 12))
-        self.footer_var = tk.StringVar(value="Quota from providers · tokens from Hermes")
-        self._label(footer, textvariable=self.footer_var, fg=self.colors["faint"], font=_font(7), anchor="w").pack(side="left")
-        tk.Button(
-            footer,
-            text="↻",
-            command=self.refresh_now,
-            bg=self.colors["window"],
-            fg=self.colors["muted"],
-            activebackground=self.colors["card"],
-            activeforeground=self.colors["text"],
-            borderwidth=0,
-            highlightthickness=0,
-            font=_font(12, "bold"),
-            cursor="hand2",
-            width=2,
-        ).pack(side="right")
-
-        self._render_all()
-        self._sync_status()
-        self._install_resize_handles(outer)
-
-    def _sync_status(self) -> None:
-        if self.last_error:
-            self.status_dot.itemconfigure("dot", fill=self.colors["red"])
-            self.status_var.set(self.last_error)
-            return
-        if self.state.get("provider_quotas") or self.state.get("session"):
-            self.status_dot.itemconfigure("dot", fill=self.colors["green"])
-            plan = next(
-                (
-                    provider.get("plan")
-                    for provider in (self.state.get("provider_quotas") or {}).get("providers") or []
-                    if isinstance(provider, dict) and provider.get("plan")
-                ),
-                None,
-            )
-            self.status_var.set(f"Live · {plan}" if plan else "Live")
-            return
-        self.status_dot.itemconfigure("dot", fill=self.colors["orange"])
-        self.status_var.set("Connecting to Hermes…")
-
-    def _render_loading_quota(self) -> None:
-        for child in self.quota_container.winfo_children():
-            child.destroy()
-        self._label(
-            self.quota_container,
-            "Checking live account limits…",
-            fg=self.colors["muted"],
-            font=_font(9),
-            anchor="w",
-        ).pack(fill="x", pady=6)
-
-    def _quota_color(self, remaining: float) -> str:
-        if remaining < 10:
-            return self.colors["red"]
-        if remaining < 30:
-            return self.colors["orange"]
-        return self.colors["green"]
-
-    def _draw_bar(self, canvas: tk.Canvas, used: float) -> None:
-        canvas.delete("all")
-        width = max(1, canvas.winfo_width())
-        height = max(1, int(canvas.cget("height")))
-        canvas.create_rectangle(0, 0, width, height, fill=self.colors["track"], outline="")
-        canvas.create_rectangle(
-            0,
-            0,
-            width * max(0.0, min(100.0, used)) / 100,
-            height,
-            fill=self.colors["accent"],
-            outline="",
-        )
 
     def _show_tooltip(self, text: str) -> None:
         self._hide_tooltip()
@@ -954,144 +913,6 @@ class UsageWidget:
             pass
         self.tooltip_window = None
 
-    def _quota_card(self, parent: tk.Misc, limit: dict[str, Any], *, small: bool) -> None:
-        card = tk.Frame(
-            parent,
-            bg=self.colors["card"],
-            highlightbackground=self.colors["border"],
-            highlightthickness=1,
-        )
-        card.pack(fill="x", pady=(0, 7))
-        top = tk.Frame(card, bg=self.colors["card"])
-        top.pack(fill="x", padx=10, pady=(8, 4))
-        group = str(limit.get("group") or "Codex account")
-        label = str(limit.get("label") or "Weekly")
-        remaining = float(limit.get("remaining_percent") or 0)
-        used = float(limit.get("used_percent") or 0)
-        self._label(top, f"{group} · {label}", bg=self.colors["card"], font=_font(8, "bold"), anchor="w").pack(side="left")
-        self._label(
-            top,
-            f"{percent(remaining)} left",
-            bg=self.colors["card"],
-            fg=self._quota_color(remaining),
-            font=_font(10, "bold"),
-        ).pack(side="right")
-        bar = tk.Canvas(card, height=6, bg=self.colors["track"], highlightthickness=0)
-        bar.pack(fill="x", padx=10, pady=(2, 8 if small else 3))
-        redraw = lambda _event=None, widget=bar, amount=used: self._draw_bar(widget, amount)
-        bar.bind("<Configure>", redraw)
-        if small:
-            tooltip_text = quota_tooltip_text(limit)
-            bar.bind("<Enter>", lambda _event, text=tooltip_text: self._show_tooltip(text))
-            bar.bind("<Leave>", lambda _event: self._hide_tooltip())
-        self.root.after_idle(redraw)
-        if not small:
-            bottom = tk.Frame(card, bg=self.colors["card"])
-            bottom.pack(fill="x", padx=10, pady=(0, 7))
-            self._label(bottom, f"{percent(used)} used", bg=self.colors["card"], fg=self.colors["faint"], font=_font(7)).pack(side="left")
-            right_text = str(limit.get("usage_text") or limit.get("period_label") or "").strip()
-            if not right_text and limit.get("reset_at") is not None:
-                right_text = reset_text(limit.get("reset_at"))
-            if right_text:
-                self._label(bottom, right_text, bg=self.colors["card"], fg=self.colors["faint"], font=_font(7)).pack(side="right")
-
-    def _render_quota(self) -> None:
-        for child in self.quota_container.winfo_children():
-            child.destroy()
-        provider_snapshot = self.state.get("provider_quotas") or {}
-        providers = [item for item in provider_snapshot.get("providers") or [] if isinstance(item, dict)]
-        session = self.state.get("session") or {}
-        rendered = 0
-        errors: list[str] = []
-        for provider in providers:
-            maximum = 1 if self.layout == "small" or provider.get("id") != "codex" else 2
-            limits = visible_limits(provider, session.get("model"), maximum=maximum)
-            for limit in limits:
-                self._quota_card(self.quota_container, limit, small=self.layout == "small")
-                rendered += 1
-            if not limits and provider.get("error"):
-                label = str(provider.get("label") or provider.get("id") or "Provider")
-                errors.append(f"{label}: {provider['error']}")
-        if self.layout != "small":
-            for message in errors[:3]:
-                self._label(self.quota_container, message, fg=self.colors["faint"], font=_font(8), anchor="w").pack(fill="x", pady=(0, 5))
-        if not rendered:
-            message = errors[0] if errors else "No provider quota was returned."
-            self._label(self.quota_container, message, fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=6)
-
-    def _render_session(self) -> None:
-        if self.layout != "full":
-            return
-        session = self.state.get("session") or {}
-        if not session.get("available"):
-            self.session_model_var.set("No active session")
-            for variable in self.metric_vars.values():
-                variable.set("—")
-            return
-        self.session_model_var.set(str(session.get("model") or "unknown"))
-        self.metric_vars["total"].set(compact_number(session.get("total_tokens")))
-        self.metric_vars["input"].set(compact_number(session.get("input_tokens")))
-        self.metric_vars["output"].set(compact_number(session.get("output_tokens")))
-        self.metric_vars["calls"].set(compact_number(session.get("api_calls")))
-
-    def _render_models(self) -> None:
-        if self.layout != "full" or self.models_container is None:
-            return
-        scroll_fraction = 0.0
-        if self.models_canvas is not None:
-            view = self.models_canvas.yview()
-            if view:
-                scroll_fraction = float(view[0])
-        for child in self.models_container.winfo_children():
-            child.destroy()
-        models_snapshot = self.state.get("models") or {}
-        session = self.state.get("session") or {}
-        models = ordered_model_rows(models_snapshot, session.get("model"))
-        total = sum(int(item.get("total_tokens") or 0) for item in models)
-        self.models_total_var.set(
-            f"{len(models)} models · {compact_number(total)} processed" if models else ""
-        )
-        if not models:
-            self._label(self.models_container, "No model telemetry yet.", fg=self.colors["muted"], font=_font(9), anchor="w").pack(fill="x", pady=8)
-            self._schedule_models_scroll_restore(scroll_fraction)
-            return
-        for index, item in enumerate(models):
-            row = tk.Frame(
-                self.models_container,
-                bg=self.colors["card_alt"],
-                highlightbackground=self.colors["border"],
-                highlightthickness=1,
-            )
-            row.pack(fill="x", pady=(0, 5))
-            left = tk.Frame(row, bg=self.colors["card_alt"])
-            left.pack(side="left", fill="both", expand=True, padx=9, pady=7)
-            model_name = str(item.get("model") or "unknown")
-            if len(model_name) > 34:
-                model_name = model_name[:31] + "…"
-            self._label(left, model_name, bg=self.colors["card_alt"], font=_font(8, "bold"), anchor="w").pack(anchor="w")
-            details = f"in {compact_number(item.get('input_tokens'))} · out {compact_number(item.get('output_tokens'))} · cache {compact_number(item.get('cache_tokens'))}"
-            self._label(left, details, bg=self.colors["card_alt"], fg=self.colors["faint"], font=_font(7), anchor="w").pack(anchor="w", pady=(2, 0))
-            self._label(row, compact_number(item.get("total_tokens")), bg=self.colors["card_alt"], font=_font(10, "bold")).pack(side="right", padx=9)
-        self._schedule_models_scroll_restore(scroll_fraction)
-
-    def _render_all(self) -> None:
-        self.monitored_providers_var.set(monitored_provider_text(self.state))
-        self._render_quota()
-        self._render_session()
-        self._render_models()
-
-    def _render_snapshot_targets(self, targets: set[str]) -> None:
-        if "providers" in targets:
-            self.monitored_providers_var.set(monitored_provider_text(self.state))
-        if "quota" in targets:
-            self._render_quota()
-        if "session" in targets:
-            self._render_session()
-        if "models" in targets:
-            self._render_models()
-        if "tray" in targets:
-            self._update_tray()
-
     def _create_tray(self) -> None:
         def command(name: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
             def handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
@@ -1112,146 +933,6 @@ class UsageWidget:
         self.tray = _DaemonTrayIcon(APP_ID, _tray_image(None), APP_NAME, menu)
         self.tray.run_detached()
 
-    def _poll_loop(self) -> None:
-        next_session = next_models = next_provider_quotas = 0.0
-        latest_session: dict[str, Any] = {}
-        latest_models: dict[str, Any] = {}
-        quota_context: tuple[tuple[str, str], ...] = ()
-        while not self.stop_event.is_set():
-            now = time.monotonic()
-            forced = self.force_all
-            self.force_all = False
-            snapshot: dict[str, Any] = {}
-            try:
-                if forced or now >= next_session:
-                    latest_session = self.data.fetch_session()
-                    snapshot["session"] = latest_session
-                    next_session = now + (10.0 if self.visible else 60.0)
-                if forced or now >= next_models:
-                    latest_models = self.data.fetch_models()
-                    snapshot["models"] = latest_models
-                    next_models = now + (15.0 if self.visible else 120.0)
-                current_context = self.data.provider_context_key(latest_session, latest_models)
-                if current_context != quota_context:
-                    next_provider_quotas = 0.0
-                if forced or now >= next_provider_quotas:
-                    snapshot["provider_quotas"] = self.data.fetch_provider_quotas(latest_session, latest_models)
-                    quota_context = current_context
-                    next_provider_quotas = now + (300.0 if self.visible else 900.0)
-                if snapshot:
-                    snapshot["collected_at"] = time.time()
-                    self.events.put(("snapshot", snapshot))
-            except Exception:
-                logging.exception("Usage polling failed")
-                self.events.put(("error", "Collector offline — retrying"))
-            wait_until = min(next_session, next_models, next_provider_quotas)
-            timeout = max(0.5, min(60.0, wait_until - time.monotonic()))
-            self.refresh_event.wait(timeout)
-            self.refresh_event.clear()
-
-    def _drain_events(self) -> None:
-        try:
-            while True:
-                kind, payload = self.events.get_nowait()
-                if kind == "snapshot":
-                    render_targets = snapshot_render_targets(self.state, payload)
-                    for key in ("provider_quotas", "session", "models"):
-                        if key in payload:
-                            self.state[key] = payload[key]
-                    self.last_updated = float(payload.get("collected_at") or time.time())
-                    self.last_error = None
-                    self._sync_status()
-                    if self.layout == "full":
-                        timestamp = time.strftime("%I:%M %p", time.localtime(self.last_updated)).lstrip("0")
-                        self.footer_var.set(f"Quota from providers · tokens from Hermes · {timestamp}")
-                    self._render_snapshot_targets(render_targets)
-                elif kind == "error":
-                    self.last_error = str(payload)
-                    self.status_dot.itemconfigure("dot", fill=self.colors["red"])
-                    self.status_var.set(self.last_error)
-                elif kind == "command":
-                    self._handle_command(str(payload))
-        except queue.Empty:
-            pass
-        if not self.quitting:
-            self.root.after(150, self._drain_events)
-
-    def _update_tray(self) -> None:
-        if not self.tray:
-            return
-        model = (self.state.get("session") or {}).get("model")
-        providers = [
-            provider
-            for provider in (self.state.get("provider_quotas") or {}).get("providers") or []
-            if isinstance(provider, dict)
-        ]
-        preferred = next((provider for provider in providers if provider.get("id") == "codex"), None)
-        limit = choose_current_limit(preferred or (providers[0] if providers else None), model)
-        remaining = float(limit.get("remaining_percent")) if limit and limit.get("remaining_percent") is not None else None
-        self.tray.icon = _tray_image(remaining)
-        self.tray.title = tray_usage_title(self.state)
-
-    def _handle_command(self, command: str) -> None:
-        if command == "toggle":
-            self.hide() if self.visible else self.show()
-        elif command == "refresh":
-            self.refresh_now()
-        elif command == "size":
-            self.toggle_size()
-        elif command == "grok":
-            self.open_grok_usage()
-        elif command == "topmost":
-            self.settings["always_on_top"] = not bool(self.settings["always_on_top"])
-            self.root.attributes("-topmost", bool(self.settings["always_on_top"]))
-            _save_settings(self.settings)
-            if self.tray:
-                self.tray.update_menu()
-        elif command == "startup":
-            try:
-                set_startup(not startup_enabled())
-            except OSError:
-                logging.exception("Could not update startup setting")
-            if self.tray:
-                self.tray.update_menu()
-        elif command == "show":
-            self.show()
-        elif command == "quit":
-            self.quit()
-
-    def toggle_size(self) -> None:
-        self.layout = "small" if self.layout == "full" else "full"
-        self._set_geometry()
-        self._build_ui()
-        if self.tray:
-            self.tray.update_menu()
-
-    def open_grok_usage(self) -> None:
-        if not launch_grok_usage():
-            self.last_error = "Could not open Grok Usage"
-            self._sync_status()
-
-    def refresh_now(self) -> None:
-        self.status_dot.itemconfigure("dot", fill=self.colors["orange"])
-        self.status_var.set("Refreshing…")
-        self.force_all = True
-        self.refresh_event.set()
-
-    def show(self) -> None:
-        self.visible = True
-        self.root.deiconify()
-        self.root.lift()
-        self.root.attributes("-topmost", bool(self.settings["always_on_top"]))
-        self.force_all = True
-        self.refresh_event.set()
-
-    def hide(self) -> None:
-        self.visible = False
-        self._hide_tooltip()
-        self.root.withdraw()
-
-    def request_ipc(self, command: str) -> None:
-        self.events.put(("command", command))
-
     def _begin_drag(self, event: tk.Event[Any]) -> None:
         self.resize_origin = None
         self.drag_origin = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
@@ -1260,7 +941,7 @@ class UsageWidget:
         if self.drag_origin is None:
             return
         start_x, start_y, window_x, window_y = self.drag_origin
-        self.root.geometry(f"+{window_x + event.x_root - start_x}+{window_y + event.y_root - start_y}")
+        self.root.geometry(f"{window_x + event.x_root - start_x:+d}{window_y + event.y_root - start_y:+d}")
 
     def _end_drag(self, _event: tk.Event[Any]) -> None:
         if self.drag_origin is None:
@@ -1286,7 +967,7 @@ class UsageWidget:
         if self.resize_origin is None:
             return
         edge, start_px, start_py, start_x, start_y, start_w, start_h = self.resize_origin
-        min_w, min_h = MIN_SIZES.get(self.layout, MIN_SIZES["full"])
+        min_w, min_h = (self.px(v) for v in MIN_SIZES.get(self.layout, MIN_SIZES["full"]))
         x, y, width, height = compute_resized_geometry(
             edge,
             start_x=start_x,
@@ -1297,9 +978,9 @@ class UsageWidget:
             pointer_dy=event.y_root - start_py,
             min_w=min_w,
             min_h=min_h,
-            work_area=_work_area(),
+            work_area=_work_area(start_x, start_y),
         )
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.geometry(f"{width}x{height}{x:+d}{y:+d}")
 
     def _end_resize(self, _event: tk.Event[Any]) -> None:
         if self.resize_origin is None:
@@ -1314,22 +995,15 @@ class UsageWidget:
         self.settings.update({"window_x": x, "window_y": y, "sizes": sizes, "layout": self.layout})
         _save_settings(self.settings)
 
-    def quit(self) -> None:
-        if self.quitting:
-            return
-        self.quitting = True
-        self._hide_tooltip()
-        self.stop_event.set()
-        self.refresh_event.set()
-        self.settings.update({"window_x": self.root.winfo_x(), "window_y": self.root.winfo_y()})
-        _save_settings(self.settings)
-        if self.tray:
-            self.tray.stop()
-        self.root.destroy()
+    def open_grok_usage(self) -> None:
+        if not launch_grok_usage():
+            self.last_error = "Could not open Grok Usage"
+            self._sync_status()
+
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Lightweight Codex usage widget")
+    parser = argparse.ArgumentParser(description="Lightweight provider quota monitor")
     parser.add_argument("--tray", action="store_true", help="Start hidden in the system tray")
     args = parser.parse_args()
     if signal_existing_instance():

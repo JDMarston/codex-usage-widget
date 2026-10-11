@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 import sqlite3
@@ -153,6 +156,9 @@ class HermesUsageData:
     def __init__(self, hermes_home: Path, quota_worker: Path) -> None:
         self.hermes_home = hermes_home
         self.db_path = hermes_home / "state.db"
+        self._processes: set[subprocess.Popen] = set()
+        self._process_lock = threading.Lock()
+        self._closed = threading.Event()
         self.quota_worker = quota_worker
         self.grok_quota_worker = quota_worker.with_name("grok_quota_worker.py")
         self.gemini_quota_worker = quota_worker.with_name("gemini_quota_worker.py")
@@ -348,118 +354,136 @@ class HermesUsageData:
             "generated_at": time.time(),
         }
 
-    def fetch_quota(self) -> dict[str, Any]:
+    def _run_worker(self, worker: Path, *args: str, timeout: float = 35) -> dict[str, Any]:
         python_exe = self.hermes_home / "hermes-agent" / "venv" / "Scripts" / "python.exe"
-        if not python_exe.exists() or not self.quota_worker.exists():
-            return {"available": False, "limits": [], "error": "Codex quota collector is unavailable."}
+        if not python_exe.exists() or not worker.exists() or self._closed.is_set():
+            return {"status": "error", "error": "Quota collector is unavailable."}
         environment = os.environ.copy()
         environment["HERMES_HOME"] = str(self.hermes_home)
+        process = None
         try:
-            completed = subprocess.run(
-                [str(python_exe), str(self.quota_worker)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=25,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                env=environment,
-                check=False,
-            )
-            if completed.returncode != 0:
-                raise RuntimeError("quota worker failed")
-            payload = json.loads(completed.stdout.strip().splitlines()[-1])
-            return payload if isinstance(payload, dict) else {"available": False, "limits": []}
+            with self._process_lock:
+                if self._closed.is_set():
+                    return {"status": "error", "error": "Collector stopped."}
+                process = subprocess.Popen(
+                    [str(python_exe), str(worker), *args], stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=environment,
+                )
+                self._processes.add(process)
+            output, _ = process.communicate(timeout=timeout)
+            if process.returncode or len(output) > 1_048_576:
+                raise ValueError("invalid worker output")
+            payload = json.loads(output.strip().splitlines()[-1])
+            if not isinstance(payload, dict):
+                raise ValueError("invalid snapshot")
+            return payload
         except Exception:
-            return {"available": False, "limits": [], "error": "Codex quota is temporarily unavailable."}
+            if process and process.poll() is None:
+                self._stop_process(process)
+            return {"status": "error", "error": "Quota refresh failed. Retrying automatically."}
+        finally:
+            if process:
+                with self._process_lock:
+                    self._processes.discard(process)
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            # Only our exact child tree; Hermes itself is never targeted.
+            subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+    def close(self) -> None:
+        self._closed.set()
+        with self._process_lock:
+            processes = list(self._processes)
+        for process in processes:
+            try:
+                self._stop_process(process)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    def fetch_quota(self) -> dict[str, Any]:
+        return self._run_worker(self.quota_worker)
 
     def fetch_grok_quota(self) -> dict[str, Any]:
-        python_exe = self.hermes_home / "hermes-agent" / "venv" / "Scripts" / "python.exe"
-        if not python_exe.exists() or not self.grok_quota_worker.exists():
-            return {"available": False, "error": "SuperGrok quota collector is unavailable."}
-        environment = os.environ.copy()
-        environment["HERMES_HOME"] = str(self.hermes_home)
-        try:
-            completed = subprocess.run(
-                [str(python_exe), str(self.grok_quota_worker)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=25,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                env=environment,
-                check=False,
-            )
-            if completed.returncode != 0:
-                raise RuntimeError("SuperGrok quota worker failed")
-            payload = json.loads(completed.stdout.strip().splitlines()[-1])
-            return payload if isinstance(payload, dict) else {"available": False}
-        except Exception:
-            return {"available": False, "error": "SuperGrok usage is temporarily unavailable."}
+        return self._run_worker(self.grok_quota_worker)
 
     def fetch_gemini_quota(self, model: str) -> dict[str, Any]:
-        python_exe = self.hermes_home / "hermes-agent" / "venv" / "Scripts" / "python.exe"
         if not model:
-            return {"available": False, "limits": [], "error": "No Gemini model has been detected yet."}
-        if not python_exe.exists() or not self.gemini_quota_worker.exists():
-            return {"available": False, "limits": [], "error": "Gemini quota collector is unavailable."}
-        environment = os.environ.copy()
-        environment["HERMES_HOME"] = str(self.hermes_home)
-        try:
-            completed = subprocess.run(
-                [str(python_exe), str(self.gemini_quota_worker), "--model", model],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=75,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                env=environment,
-                check=False,
-            )
-            if completed.returncode != 0:
-                raise RuntimeError("Gemini quota worker failed")
-            payload = json.loads(completed.stdout.strip().splitlines()[-1])
-            return payload if isinstance(payload, dict) else {"available": False, "limits": []}
-        except Exception:
-            return {
-                "available": False,
-                "limits": [],
-                "error": "Gemini quota is temporarily unavailable.",
-            }
+            return {"status": "error", "error": "No Gemini model recorded yet."}
+        return self._run_worker(self.gemini_quota_worker, "--model", model, timeout=75)
 
-    def fetch_provider_quotas(
-        self,
-        session: dict[str, Any] | None,
-        models: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        detected = self.configured_provider_ids()
+    def fetch_provider_quotas(self, session, models, *, on_provider=None) -> dict[str, Any]:
+        configured = self.configured_provider_ids()
         collectors = {
             "codex": self.fetch_quota,
             "grok": self.fetch_grok_quota,
             "gemini": lambda: self.fetch_gemini_quota(provider_model_for("gemini", session, models)),
         }
-        providers: list[dict[str, Any]] = []
-        for provider in detected:
-            payload = collectors[provider]()
-            limits = payload.get("limits")
-            if not isinstance(limits, list):
-                limit = payload.get("limit")
-                limits = [limit] if isinstance(limit, dict) else []
-            limits = [item for item in limits if isinstance(item, dict)]
-            providers.append(
-                {
-                    "id": provider,
-                    "label": PROVIDER_LABELS[provider],
-                    "available": bool(limits),
-                    "limits": limits,
-                    "plan": payload.get("plan"),
-                    "source": payload.get("source"),
-                    "error": payload.get("error"),
-                    "fetched_at": payload.get("fetched_at") or time.time(),
-                }
-            )
-        return {
-            "available": any(item.get("available") for item in providers),
-            "providers": providers,
-            "context": list(provider_context_key(session, models, detected)),
-            "generated_at": time.time(),
-        }
+        results = {}
+        # Short-lived parallel work: a slow provider cannot hold the other cards.
+        if configured:
+            with ThreadPoolExecutor(max_workers=len(configured), thread_name_prefix="quota") as executor:
+                pending = {executor.submit(collectors[provider]): provider for provider in configured}
+                for future in as_completed(pending):
+                    provider = pending[future]
+                    try:
+                        payload = future.result()
+                    except Exception:
+                        payload = {"status": "error", "error": "Quota refresh failed."}
+                    item = normalize_provider(provider, payload)
+                    results[provider] = item
+                    if on_provider and not self._closed.is_set():
+                        on_provider(item)
+        providers = [results[provider] for provider in configured if provider in results]
+        return {"available": any(item["available"] for item in providers), "providers": providers,
+                "context": list(provider_context_key(session, models, configured)), "generated_at": time.time()}
+
+
+def normalize_provider(provider: str, payload: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    now = time.time() if now is None else now
+    raw = payload.get("limits")
+    if not isinstance(raw, list):
+        raw = [payload["limit"]] if isinstance(payload.get("limit"), dict) else []
+    limits = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        used, left = item.get("used_percent"), item.get("remaining_percent")
+        # Derive complementary fields only from a genuine finite percentage.
+        if used is None and isinstance(left, (int, float)) and not isinstance(left, bool):
+            used = 100 - left
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used <= 100:
+            continue
+        limits.append({**item, "used_percent": used, "remaining_percent": 100 - used})
+    status = payload.get("status") or ("ok" if limits and payload.get("available") is not False else "error")
+    if status == "ok" and not limits:
+        status = "error"
+    if status not in {"ok", "not_reported", "auth_required", "error"}:
+        status = "error"
+    if status != "ok":
+        limits = []
+    result = {"id": provider, "label": PROVIDER_LABELS[provider], "available": bool(limits),
+              "limits": limits, "status": status, "checked_at": now, "stale": False,
+              "fetched_at": (payload.get("fetched_at") or payload.get("collected_at") or now)
+                            if status in {"ok", "not_reported"} else None}
+    for key in ("plan", "source", "error", "notice", "period_start_at", "reset_at", "period_label"):
+        if payload.get(key) is not None:
+            result[key] = payload[key]
+    return result
+
+
+def merge_provider(previous: dict | None, current: dict) -> dict:
+    """Retain last good numbers on transport failure, not on unpublished usage."""
+    if current.get("status") == "error" and previous and previous.get("limits"):
+        return {**previous, "status": "error", "stale": True,
+                "checked_at": current["checked_at"], "error": current.get("error")}
+    return current
