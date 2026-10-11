@@ -8,7 +8,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
 from fastapi import APIRouter
 
 from hermes_constants import get_hermes_home
@@ -182,10 +181,10 @@ def _parse_quota_payload(payload: Any) -> dict[str, Any]:
     }
 
 
-def _fallback_quota_snapshot() -> dict[str, Any]:
-    from agent.account_usage import fetch_account_usage
-
-    snapshot = fetch_account_usage("openai-codex")
+def _fallback_quota_snapshot(snapshot=None) -> dict[str, Any]:
+    if snapshot is None:
+        from agent.account_usage import fetch_account_usage
+        snapshot = fetch_account_usage("openai-codex")
     if snapshot is None:
         return {
             "available": False,
@@ -229,34 +228,19 @@ def _fallback_quota_snapshot() -> dict[str, Any]:
 
 def _quota_snapshot_uncached() -> dict[str, Any]:
     try:
-        from agent.account_usage import (
-            _resolve_codex_usage_credentials,
-            _resolve_codex_usage_url,
-        )
-
-        token, base_url, account_id = _resolve_codex_usage_credentials(None, None)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": "codex-cli",
-        }
-        if account_id:
-            headers["ChatGPT-Account-Id"] = account_id
-        with httpx.Client(timeout=15.0) as client:
-            response = client.get(_resolve_codex_usage_url(base_url), headers=headers)
-            response.raise_for_status()
-        return _parse_quota_payload(response.json())
+        # Prefer Hermes's public snapshot; private endpoint helpers change names.
+        from agent.account_usage import fetch_account_usage
+        snapshot = fetch_account_usage("openai-codex")
+        if snapshot is None:
+            raise ValueError("No Codex quota snapshot")
+        raw = getattr(snapshot, "raw", None)
+        if isinstance(raw, dict):
+            # Only allowlisted numeric/model fields reach the renderer.
+            return _parse_quota_payload(raw)
+        return _fallback_quota_snapshot(snapshot)
     except Exception:
-        try:
-            return _fallback_quota_snapshot()
-        except Exception:
-            return {
-                "available": False,
-                "provider": "openai-codex",
-                "limits": [],
-                "fetched_at": time.time(),
-                "error": "Codex quota is temporarily unavailable.",
-            }
+        return {"available": False, "limits": [], "status": "error",
+                "error": "Codex quota is temporarily unavailable."}
 
 
 def _quota_snapshot() -> dict[str, Any]:

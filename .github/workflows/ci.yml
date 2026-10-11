@@ -3,21 +3,40 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test-and-build:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
           cache: pip
-      - run: pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
-      - run: python -m py_compile app.py data_client.py quota_worker.py build.py
+      - run: python -m pip install --require-hashes -r requirements.txt
+      - name: Unit and mapped native UI regression tests
+        run: python -m unittest discover -s tests -v
+      - name: Compile all application and collector sources
+        run: python -m compileall -q app.py usage_ui.py data_client.py quota_worker.py grok_quota_worker.py gemini_quota_worker.py build.py install-hermes-plugin.py hermes-plugin/plugins/codex-usage/dashboard/plugin_api.py
+      - name: Parse Windows installer
+        shell: pwsh
+        run: |
+          $Errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path install.ps1), [ref]$null, [ref]$Errors) | Out-Null
+          if ($Errors.Count) { throw ($Errors | Out-String) }
       - run: python build.py
-      - uses: actions/upload-artifact@v4
+      - name: Validate packaged installer and integrity manifest
+        shell: pwsh
+        run: ./install.ps1 -SourceDir ./dist/CodexUsageWidget -ValidateOnly
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: CodexUsageWidget-windows-x64
-          path: dist/CodexUsageWidget-windows-x64.zip
+          if-no-files-found: error
+          path: |
+            dist/CodexUsageWidget-windows-x64.zip
+            dist/CodexUsageWidget-windows-x64.zip.sha256

@@ -1,0 +1,4 @@
+# Runtime stays Tkinter + tray + raster icon only.
+pystray==0.19.5
+Pillow>=12.3,<13
+pyinstaller>=6.21,<7

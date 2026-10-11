@@ -17,9 +17,8 @@ def hermes_home() -> Path:
 def main() -> int:
     home = hermes_home()
     source_root = home / "hermes-agent"
-    backend_path = home / "plugins" / "codex-usage" / "dashboard" / "plugin_api.py"
-    if not backend_path.exists():
-        backend_path = Path(__file__).resolve().parent / "hermes-plugin" / "plugins" / "codex-usage" / "dashboard" / "plugin_api.py"
+    # Use the version shipped and tested with this build, never an old installed plugin.
+    backend_path = Path(__file__).resolve().parent / "hermes-plugin" / "plugins" / "codex-usage" / "dashboard" / "plugin_api.py"
     if not backend_path.exists():
         print(json.dumps({"available": False, "limits": [], "error": "Codex quota plugin is not installed."}))
         return 0
